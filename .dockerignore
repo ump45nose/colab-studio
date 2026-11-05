@@ -3,8 +3,10 @@
 *.env
 .venv
 **/node_modules
-**/dist
+mcp/dist
 **/__pycache__
+.worktree
+.spec
 **/test-results
 **/playwright-report
 mcp

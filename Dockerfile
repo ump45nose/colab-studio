@@ -1,25 +1,30 @@
-FROM node:22-slim AS web
-WORKDIR /web
-COPY server/web/package.json server/web/package-lock.json* ./
-RUN npm install --no-audit --no-fund
-COPY server/web/ ./
-RUN npm run build
-
 FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    STUDIO_HOST=0.0.0.0 \
+    STUDIO_PORT=18104 \
+    STUDIO_DATA=/data \
+    STUDIO_IN_DOCKER=1 \
+    COLAB_BIN=/usr/local/bin/colab
+
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-client curl ca-certificates tar ffmpeg \
+ && apt-get install -y --no-install-recommends openssh-client curl ca-certificates tar \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /usr/local/bin/uv
-ENV UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin UV_PYTHON_DOWNLOADS=never
-RUN uv tool install --python /usr/local/bin/python3.12 google-colab-cli
+
 WORKDIR /app
 COPY server/requirements.txt server/requirements.txt
-RUN pip install --no-cache-dir -r server/requirements.txt
+RUN pip install --no-cache-dir -r server/requirements.txt google-colab-cli \
+ && groupadd --gid 1001 studio \
+ && useradd --uid 1000 --gid 1001 --create-home --home-dir /home/studio studio \
+ && install -d -m 0755 -o 1000 -g 1001 /data /home/studio/.config/colab-cli
+
 COPY VERSION ./
 COPY station/ station/
 COPY server/ server/
-COPY --from=web /web/dist server/web/dist
-ENV STUDIO_HOST=0.0.0.0 STUDIO_PORT=8190 STUDIO_DATA=/data STUDIO_IN_DOCKER=1
-VOLUME ["/data", "/root/.config/colab-cli"]
-EXPOSE 8190
-CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8190"]
+
+VOLUME ["/data", "/home/studio/.config/colab-cli"]
+EXPOSE 18104
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('STUDIO_PORT', '18104') + '/api/state', timeout=3).read()"
+CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "18104"]

@@ -1,0 +1,19 @@
+{
+  "name": "Colab Studio — 远程 GPU 生图·视频·换脸工作台",
+  "short_name": "ColabStudio",
+  "description": "轻量级远程 Colab GPU 图片生成、视频合成与全自动换脸流水线 PWA 工作台",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0b0c",
+  "theme_color": "#0b0b0c",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

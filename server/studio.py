@@ -1,646 +1,654 @@
-"""Stüdyo: sohbetler, işler ve medya.
+"""Job queue, persistent state (`chats` + `jobs`), ComfyUI WebSocket runner, and FaceSwap pipeline."""
+from __future__ import annotations
 
-İşler sırayla çalışır. GPU kapalıysa ilk iş runtime'ı açar ve hazır olmasını bekler. Sonuçlar
-sunucuya indirilir (GPU kapanınca runtime'daki kopyalar silinir). 30 günden eski sohbetler silinir.
-"""
 import asyncio
-import itertools
 import json
+import os
 import random
-import sqlite3
+import shlex
 import time
 import uuid
 from pathlib import Path
 
-from aiohttp import ClientSession, ClientTimeout, FormData, WSMsgType
+import httpx
+import websockets
 
-import config
-import runtime
-import tracker
-import workflows
+from station import faceswap_runner
+from . import config, dreamid_pipeline, tracker, workflows
+from .runtime import PACK_LABELS, runtime
 
-DATA_DIR = config.DATA_DIR
-MEDIA_DIR = DATA_DIR / "media"
-DB_PATH = DATA_DIR / "studio.db"
-RETENTION_DAYS = 30
-CLEANUP_SECONDS = 6 * 3600
-JOB_TIMEOUT = 1800
-CLIENT_ID = "colab-studio"
+STATE_FILE = config.DATA_DIR / "state.json"
+MEDIA_DIR = config.DATA_DIR / "media"
+JOB_TIMEOUT = 30 * 60
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS threads (
-  id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS jobs (
-  id TEXT PRIMARY KEY, thread_id TEXT, mode TEXT NOT NULL, kind TEXT NOT NULL,
-  prompt TEXT NOT NULL, params TEXT NOT NULL, inputs TEXT NOT NULL,
-  status TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, error TEXT,
-  outputs TEXT NOT NULL DEFAULT '[]', text TEXT,
-  created_at REAL NOT NULL, finished_at REAL
-);
-CREATE TABLE IF NOT EXISTS presets (
-  id TEXT PRIMARY KEY, mode TEXT NOT NULL, name TEXT NOT NULL, params TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS credit_samples (ts REAL PRIMARY KEY, balance REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS timings (key TEXT PRIMARY KEY, seconds REAL NOT NULL);
-"""
-CREDIT_SAMPLE_SECONDS = 300
-
-# İşin o an çalışan düğümüne göre kullanıcıya gösterilen aşama
-STAGES = {
-    "UNETLoader": "Modeller yükleniyor",
-    "CLIPLoader": "Modeller yükleniyor",
-    "VAELoader": "Modeller yükleniyor",
-    "QwenImage21Cache": "Modeller yükleniyor",
-    "LoadImage": "Referanslar okunuyor",
-    "TextEncodeQwenImage21": "İstem işleniyor",
-    "TextGenerate": "İstem geliştiriliyor",
-    "KSampler": "Üretiliyor",
-    "VAEDecode": "Kaydediliyor",
-    "SaveImage": "Kaydediliyor",
-    "LoraLoaderModelOnly": "Modeller yükleniyor",
-    "MiniMaxH3ImageToVideo": "İstem işleniyor",
-    "SamplerCustomAdvanced": "Üretiliyor",
-    "VAEDecodeAudio": "Ses çözülüyor",
-    "CreateVideo": "Kaydediliyor",
-    "SaveVideo": "Kaydediliyor",
-    "CheckpointLoaderSimple": "Modeller yükleniyor",
-    "YuE2GenerateMusic": "Melodi ve vokal planlanıyor",
-    "SaveAudioMP3": "Kaydediliyor",
-    "ChatterBoxOfficial23LangEngineNode": "Ses modeli hazırlanıyor",
-    "Qwen3TTSEngineNode": "Ses modeli hazırlanıyor",
-    "LoadAudio": "Ses dosyası okunuyor",
-    "CharacterVoicesNode": "Referans ses işleniyor",
-    "UnifiedTTSTextNode": "Seslendiriliyor",
-    "Apply Whisper": "Yazıya dökülüyor",
-    "LoadBackgroundRemovalModel": "Modeller yükleniyor",
-    "CLIPVisionLoader": "Modeller yükleniyor",
-    "RemoveBackground": "Arka plan ayrılıyor",
-    "Trellis2Conditioning": "Görsel işleniyor",
-    "VaeDecodeStructureTrellis2": "Kaba yapı çözülüyor",
-    "VaeDecodeShapeTrellis": "Şekil çözülüyor",
-    "VaeDecodeTextureTrellis": "Doku çözülüyor",
-    "RemeshMesh": "Ağ temizleniyor",
-    "DecimateMesh": "Ağ sadeleştiriliyor",
-    "PaintMesh": "Renkler boyanıyor",
-    "UnwrapMesh": "UV açılıyor",
-    "BakeTextureFromVoxel": "Doku pişiriliyor",
-    "BakeNormalMapFromMesh": "Normal haritası pişiriliyor",
-    "BakeAmbientOcclusion": "Gölgelendirme pişiriliyor",
-    "SaveGLB": "Kaydediliyor",
-}
-
-db = None
-# İstem geliştirme kısa ve kullanıcı sonucunu bekliyor: sıradaki işlerin önüne geçer.
-queue = asyncio.PriorityQueue()
-CANCELLED = "İptal edildi"
-cancelled = set()  # iptal istenen çalışan işler; ComfyUI kesilince hata yerine bu yazılır
-# Çalışan işin canlı durumu (kalan süre, aşamanın süresi, son güncelleme); yalnızca bellekte.
-live = {}
+chats: dict[str, dict] = {}
+jobs: dict[str, dict] = {}
+presets: dict[str, dict] = {}
+_queue: asyncio.Queue[str] = asyncio.Queue()
+_running_tasks: dict[str, asyncio.Task] = {}
+_comfy_prompt_ids: dict[str, str] = {}
 
 
-def init():
-    global db
+def load_state() -> None:
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    (MEDIA_DIR / "uploads").mkdir(exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    # Silinen satırların metni (istem, parametreler, yazıya döküm) sayfa içinde kalmasın:
-    # DELETE sırasında içerik sıfırlanır. Bu ayardan önce silinmiş kayıtların artıkları açılışta
-    # bir kez VACUUM ile atılır (aşağıda); silme yolunda VACUUM gerekmez, tüm dosyayı yeniden yazardı.
-    db.execute("PRAGMA secure_delete=ON")
-    db.executescript(SCHEMA)
-    if "stage" not in {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}:
-        db.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
-    # Servis yeniden başladıysa çalışan iş yarıda kalmıştır; sıradakiler yeniden kuyruğa girer.
-    db.execute("UPDATE jobs SET status='error', error='Servis yeniden başladı' WHERE status='running'")
-    db.execute("UPDATE jobs SET status='queued' WHERE status='waiting_gpu'")
-    db.commit()
-    # secure_delete açılmadan önce silinmiş kayıtların artıkları yalnız VACUUM ile gider; bir kez
-    # yeter, silme yolunda tekrarlanmaz. Kilitliyse bir sonraki açılışta yeniden denenir.
+    if not STATE_FILE.exists():
+        return
     try:
-        db.execute("VACUUM")
-    except sqlite3.OperationalError:
-        pass
-    prune_timings()
-    for r in db.execute("SELECT id, kind, created_at FROM jobs WHERE status='queued'"):
-        _enqueue(r["id"], r["kind"], r["created_at"])
+        data = json.loads(STATE_FILE.read_text())
+        chats.update(data.get("chats", {}))
+        jobs.update(data.get("jobs", {}))
+        presets.update(data.get("presets", {}))
+        for j in jobs.values():
+            if j.get("status") in ("queued", "running"):
+                j["status"] = "error"
+                j["error"] = "服务已重启，未完成的任务已终止"
+    except Exception as e:
+        print(f"[state] 状态读取失败: {e}")
 
 
-def _enqueue(jid, kind, created_at):
-    queue.put_nowait((0 if kind == "enhance" else 1, created_at, jid))
+def save_state() -> None:
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    payload = json.dumps({"chats": chats, "jobs": jobs, "presets": presets}, ensure_ascii=False, indent=2)
+    tmp.write_text(payload)
+    os.replace(tmp, STATE_FILE)
 
 
-def _job_dict(row):
-    d = dict(row)
-    for k in ("params", "inputs", "outputs"):
-        d[k] = json.loads(d[k])
-    state = live.get(d["id"]) if d["status"] in ("running", "waiting_gpu") else None
-    d["live"] = state() if state else None
-    if d["live"]:
-        d["progress"] = d["live"]["progress"]
-    return d
+def create_chat(mode: str = "image", title: str = "") -> dict:
+    cid = uuid.uuid4().hex[:10]
+    chat = {
+        "id": cid,
+        "mode": mode,
+        "title": title or "新对话",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+    chats[cid] = chat
+    save_state()
+    return chat
 
 
-# --- öğrenilmiş süreler (ilerleme ve kalan süre tahmini için) ---
-
-# Okuma yolu (her durum yoklamasında queue_info + her işte tracker) tabloyu yeniden taramasın.
-_timings = None
-
-
-def timings():
-    """Öğrenilmiş süreler; değişince (learn/prune) önbellek atılır."""
-    global _timings
-    if _timings is None:
-        _timings = {r["key"]: r["seconds"] for r in db.execute("SELECT key, seconds FROM timings")}
-    return _timings
-
-
-def learn_timings(measured):
-    """Yeni ölçüm eskisiyle yarı yarıya karışır: tek bir sapma tahmini bozmaz, değişim çabuk yansır."""
-    global _timings
-    known = timings()
-    for key, sec in measured.items():
-        value = sec if key not in known else 0.5 * known[key] + 0.5 * sec
-        db.execute("INSERT OR REPLACE INTO timings VALUES (?,?)", (key, round(value, 2)))
-    db.commit()
-    _timings = None
+def delete_chat(cid: str) -> bool:
+    if cid not in chats:
+        return False
+    dead_jids = [jid for jid, j in jobs.items() if j.get("chat_id") == cid]
+    still_used: set[str] = set()
+    for _jid, j in jobs.items():
+        if j.get("chat_id") != cid:
+            still_used.update(j.get("inputs") or [])
+            still_used.update(o.get("file", "") for o in (j.get("outputs") or []))
+    for jid in dead_jids:
+        j = jobs.pop(jid, {})
+        for f in [*(j.get("inputs") or []), *(o.get("file", "") for o in (j.get("outputs") or []))]:
+            if f and f not in still_used:
+                (MEDIA_DIR / Path(f).name).unlink(missing_ok=True)
+    del chats[cid]
+    save_state()
+    return True
 
 
-def prune_timings():
-    """Bilinen variant kalıplarına uymayan (eskimiş) süre anahtarlarını siler; yoksa tabloda birikir."""
-    global _timings
-    stale = [k for k in timings() if not tracker.is_known_timing_key(k)]
-    db.executemany("DELETE FROM timings WHERE key=?", [(k,) for k in stale])
-    db.commit()
-    _timings = None
-    return stale
-
-
-# --- sohbetler ---
-
-def list_threads(mode=None):
-    """mode verilmezse tüm modların sohbetleri (MCP gibi istemciler tek çağrıda hepsini görür)."""
-    if mode is None:
-        rows = db.execute("SELECT * FROM threads ORDER BY created_at DESC").fetchall()
-    else:
-        rows = db.execute("SELECT * FROM threads WHERE mode=? ORDER BY created_at DESC", (mode,)).fetchall()
-    return [dict(r) for r in rows]
-
-
-def create_thread(mode, title):
-    tid = uuid.uuid4().hex
-    db.execute("INSERT INTO threads VALUES (?,?,?,?)", (tid, mode, title[:80], time.time()))
-    db.commit()
-    return dict(db.execute("SELECT * FROM threads WHERE id=?", (tid,)).fetchone())
-
-
-def get_thread(tid):
-    thread = db.execute("SELECT * FROM threads WHERE id=?", (tid,)).fetchone()
-    if thread is None:
-        return None
-    jobs = db.execute("SELECT * FROM jobs WHERE thread_id=? ORDER BY created_at", (tid,)).fetchall()
-    return {**dict(thread), "jobs": [_job_dict(j) for j in jobs]}
-
-
-def delete_thread(tid):
-    outputs, inputs = set(), set()
-    for job in db.execute("SELECT outputs, inputs FROM jobs WHERE thread_id=?", (tid,)).fetchall():
-        outputs.update(json.loads(job["outputs"]))
-        inputs.update(json.loads(job["inputs"]))
-    db.execute("DELETE FROM jobs WHERE thread_id=?", (tid,))
-    db.execute("DELETE FROM threads WHERE id=?", (tid,))
-    db.commit()
-    # Çıktılar ve referans dosyaları sohbetle birlikte gider; başka sohbetteki bir işin girdisi olan
-    # dosya ("bu görselden 3D yap") kalır, o iş de silinince sweep_orphans temizler.
-    still_used = set()
-    for row in db.execute("SELECT inputs FROM jobs").fetchall():
-        still_used.update(json.loads(row["inputs"]))
-    for name in (outputs | inputs) - still_used:
-        (MEDIA_DIR / name).unlink(missing_ok=True)
-
-
-# --- ön ayarlar ---
-
-def get_settings():
-    return {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM settings")}
-
-
-def save_setting(key, value):
-    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
-    db.commit()
-
-
-def queue_info():
-    """Bekleyen işlerin sırası, o an çalışan iş ve sıradakilerin tahmini başlama süresi (çalışan
-    işin kalanı + öndeki işlerin öğrenilmiş süreleri); arayüz 'Sırada' satırında gösterir."""
-    rows = [_job_dict(r) for r in db.execute(
-        "SELECT * FROM jobs WHERE status IN ('queued','waiting_gpu','running') "
-        "ORDER BY status = 'queued', kind != 'enhance', created_at"
-    )]
-    running = next((r for r in rows if r["status"] != "queued"), None)
-    known = timings()
-    wait = 0.0
-    if running and running["status"] == "waiting_gpu":
-        startup = runtime.startup_progress()
-        total = known.get(f"{running['kind']}|{tracker.variant(running)}|total")
-        wait = startup["remaining_seconds"] + total if startup and total is not None else None
-    elif running:
-        wait = running["live"]["eta"] if running["live"] else None
-    starts_in = {}
-    for r in rows:
-        if r["status"] != "queued":
-            continue
-        starts_in[r["id"]] = round(wait) if wait is not None else None
-        total = known.get(f"{r['kind']}|{tracker.variant(r)}|total")
-        wait = wait + total if wait is not None and total is not None else None
-    current = {k: running[k] for k in ("id", "kind", "status", "stage", "progress", "prompt")} if running else None
-    return {"order": [r["id"] for r in rows], "current": current, "starts_in": starts_in}
-
-
-def list_presets(mode=None):
-    if mode is None:
-        rows = db.execute("SELECT * FROM presets ORDER BY mode, name").fetchall()
-    else:
-        rows = db.execute("SELECT * FROM presets WHERE mode=? ORDER BY name", (mode,)).fetchall()
-    return [{**dict(r), "params": json.loads(r["params"])} for r in rows]
-
-
-def save_preset(mode, name, params):
-    pid = uuid.uuid4().hex
-    db.execute("INSERT INTO presets VALUES (?,?,?,?)", (pid, mode, name[:60], json.dumps(params)))
-    db.commit()
-    return pid
-
-
-def delete_preset(pid):
-    db.execute("DELETE FROM presets WHERE id=?", (pid,))
-    db.commit()
-
-
-# --- yüklemeler ---
-
-def save_upload(data, ext):
-    name = f"uploads/{uuid.uuid4().hex}{ext}"
-    (MEDIA_DIR / name).write_bytes(data)
-    return name
-
-
-# --- işler ---
-
-def create_job(thread_id, mode, kind, prompt, params, inputs):
-    for name in inputs:
-        path = (MEDIA_DIR / name).resolve()
-        if not path.is_relative_to(MEDIA_DIR.resolve()) or not path.is_file():
-            raise ValueError(f"yüklenen dosya bulunamadı: {name}")
-    jid = uuid.uuid4().hex
-    db.execute(
-        "INSERT INTO jobs (id, thread_id, mode, kind, prompt, params, inputs, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (jid, thread_id, mode, kind, prompt, json.dumps(params), json.dumps(inputs), "queued", time.time()),
-    )
-    db.commit()
-    job = get_job(jid)
-    _enqueue(jid, kind, job["created_at"])
+def enqueue(chat_id: str | None, kind: str, prompt: str, params: dict, inputs: list[str] | None = None) -> dict:
+    jid = uuid.uuid4().hex[:10]
+    now = time.time()
+    job = {
+        "id": jid,
+        "chat_id": chat_id,
+        "kind": kind,
+        "prompt": prompt,
+        "params": params,
+        "inputs": inputs or [],
+        "status": "queued",
+        "stage": "排队中",
+        "progress": 0,
+        "outputs": [],
+        "error": None,
+        "created_at": now,
+        "started_at": None,
+        "finished_at": None,
+    }
+    jobs[jid] = job
+    if chat_id and chat_id in chats:
+        c = chats[chat_id]
+        c["updated_at"] = now
+        if c["title"] in ("新对话", "Yeni sohbet") and prompt.strip():
+            c["title"] = prompt.strip()[:48]
+    save_state()
+    _queue.put_nowait(jid)
     return job
 
 
-def get_job(jid):
-    row = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
-    return _job_dict(row) if row else None
+def _update(jid: str, **fields) -> None:
+    if jid in jobs:
+        jobs[jid].update(fields)
+        save_state()
 
 
-def _update(jid, **fields):
-    keys = ", ".join(f"{k}=?" for k in fields)
-    db.execute(f"UPDATE jobs SET {keys} WHERE id=?", (*fields.values(), jid))
-    db.commit()
+async def cancel_job(jid: str) -> dict | None:
+    j = jobs.get(jid)
+    if not j:
+        return None
+    if j["status"] == "queued":
+        _update(jid, status="cancelled", stage=None, error="已取消", finished_at=time.time())
+        return jobs[jid]
+    if j["status"] == "running":
+        _update(jid, status="cancelled", stage=None, error="已取消", finished_at=time.time())
+        task = _running_tasks.get(jid)
+        if task:
+            task.cancel()
+        if runtime.state == "ready":
+            try:
+                async with httpx.AsyncClient(timeout=5) as http:
+                    pid = _comfy_prompt_ids.get(jid)
+                    if pid:
+                        await http.post(f"{runtime.COMFY_URL}/queue", json={"delete": [pid]})
+                    await http.post(f"{runtime.COMFY_URL}/interrupt")
+            except Exception:
+                pass
+        elif runtime.state == "starting":
+            other_active = any(
+                o["id"] != jid and o["status"] in ("queued", "running")
+                for o in jobs.values()
+            )
+            if not other_active:
+                asyncio.create_task(runtime.stop("任务已取消，正在关闭 GPU"))
+    return jobs[jid]
 
 
-def has_pending_jobs():
-    return db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','waiting_gpu','running') LIMIT 1").fetchone() is not None
+# --- Worker loop -----------------------------------------------------------
+
+STAGES: dict[str, list[str]] = {
+    "image": ["正在加载模型", "正在读取参考图", "正在编码提示词", "正在准备画布", "正在生成", "正在保存"],
+    "video": [
+        "正在加载模型",
+        "正在读取参考图",
+        "正在编码提示词",
+        "正在准备画布",
+        "正在生成",
+        "正在生成（高噪阶段）",
+        "正在生成（低噪阶段）",
+        "正在解码音频",
+        "正在保存",
+    ],
+    "faceswap": ["正在释放显存与上传素材", "正在执行换脸流水线", "正在回传换脸结果"],
+}
 
 
-MODEL_LABELS = {"image": "Görsel", "enhance": "İstem geliştirme", "video": "Video", "music": "Müzik", "speech": "Ses", "transcribe": "Yazıya dökme", "model3d": "3D"}
+def _pack_for_job(job: dict) -> str | None:
+    """Resolve which station model pack (`image`, `image_turbo`, `video`, `video_wan22`, or `None`) a job needs."""
+    kind = job["kind"]
+    params = job.get("params") or {}
+    if kind == "faceswap":
+        return None
+    if kind == "image":
+        if params.get("profile") == "z_image_turbo_nsfw" and not job.get("inputs"):
+            return "image_turbo"
+        return "image"
+    if kind == "video":
+        if params.get("profile") == "wan22_remix":
+            return "video_wan22"
+        return "video"
+    return None
 
 
-async def interrupt_comfy():
-    async with ClientSession(timeout=ClientTimeout(total=10)) as http:
-        async with http.post(f"{runtime.COMFY_URL}/interrupt") as r:
-            r.raise_for_status()
-
-
-async def cancel_job(jid):
-    """Sıradaki iş hemen düşer; çalışan işte ComfyUI kesilir, worker işi iptal olarak kapatır."""
-    job = get_job(jid)
-    if job["status"] in ("queued", "waiting_gpu"):
-        cancelled.add(jid)
-        _update(jid, status="error", error=CANCELLED, finished_at=time.time())
-    elif job["status"] == "running":
-        cancelled.add(jid)
-        await interrupt_comfy()
-    return get_job(jid)
-
-
-def _waiting_models(jid, kind, st):
-    """İşin modelleri henüz inmemişse inme durumu işin satırında görünür."""
-    label = MODEL_LABELS[kind]
-    if st is None:  # indirme durumu henüz okunmadı
-        _update(jid, stage=f"{label} modelleri hazırlanıyor")
-        return
-    gb = 1024 ** 3
-    if st["fraction"] >= 1:  # xet son parçaları diske yazıp dosyayı yerine koyuyor
-        text = f"{label} modelleri diske yazılıyor · {st['total'] / gb:.1f} GB"
-    else:
-        text = f"{label} modelleri iniyor · {st['done'] / gb:.1f}/{st['total'] / gb:.1f} GB"
-        if st["rate"]:
-            text += f" · {st['rate'] / 2**20:.0f} MB/s"
-    _update(jid, stage=text, progress=st["fraction"])
-    live[jid] = lambda: {"progress": st["fraction"], "eta": st["eta"], "stage_seconds": None, "stage_expected": None, "loading": False}
-
-
-async def worker():
-    """Kuyruk işleyicisi. Tek bir işin ya da veritabanının beklenmedik hatası döngüyü durdurmaz:
-    döngü durursa yeni işler hiç alınmaz, GPU açılışı da kuyruktaki işi bulamaz (servis yeniden
-    başlayana kadar stüdyo ölü kalır)."""
+async def worker_loop() -> None:
     while True:
-        _, _, jid = await queue.get()
+        jid = await _queue.get()
+        job = jobs.get(jid)
+        if not job or job["status"] != "queued":
+            continue
+        task = asyncio.create_task(_work(jid))
+        _running_tasks[jid] = task
         try:
-            await _work(jid)
-        except Exception as e:  # işin kendi hataları _work içinde yakalanır; buraya kalan kök neden
-            runtime.log(f"iş {jid[:8]}: beklenmedik hata: {runtime.short_error(e, 300)}")
-            try:
-                _update(jid, status="error", error=runtime.short_error(e), finished_at=time.time())
-            except Exception as write_error:
-                runtime.log(f"iş {jid[:8]}: hata durumu yazılamadı: {runtime.short_error(write_error, 200)}")
+            await task
+        except asyncio.CancelledError:
+            pass
         finally:
-            try:
-                if get_job(jid) is None:  # sohbet iş sürerken silindi: indirilen çıktı sahipsiz kalmasın
-                    for f in MEDIA_DIR.glob(f"{jid}_*"):
-                        f.unlink()
-            except Exception as e:
-                runtime.log(f"iş {jid[:8]}: sahipsiz çıktı temizlenemedi: {runtime.short_error(e, 200)}")
-            cancelled.discard(jid)
-            live.pop(jid, None)
-            runtime.touch()
+            _running_tasks.pop(jid, None)
+            _comfy_prompt_ids.pop(jid, None)
 
 
-async def _work(jid):
-    job = get_job(jid)
-    if job is None or job["status"] != "queued":  # iptal edilmiş ya da silinmiş
-        cancelled.discard(jid)
+async def _work(jid: str) -> None:
+    job = jobs[jid]
+    runtime.active_jobs += 1
+    try:
+        _update(jid, status="running", stage=runtime.step if runtime.state != "ready" else "正在准备", started_at=time.time())
+        try:
+            await runtime.ensure_ready()
+        except Exception as e:
+            if jobs[jid]["status"] != "cancelled":
+                _update(jid, status="error", stage=None, error=f"GPU 启动失败: {e}", finished_at=time.time())
+            return
+
+        pack = _pack_for_job(job)
+        if pack is not None:
+            label = PACK_LABELS.get(pack, pack)
+
+            def _pack_progress(p: dict) -> None:
+                done = p.get("done_gb", 0)
+                tot = p.get("total_gb") or 1
+                pct = min(99, int(done * 100 / tot))
+                cur = p.get("current")
+                if p.get("writing"):
+                    txt = f"正在将 {label} 模型写入磁盘 · {done}/{tot} GB"
+                elif cur:
+                    txt = f"正在下载 {label} 模型 · {cur} ({done}/{tot} GB)"
+                else:
+                    txt = f"正在准备 {label} 模型"
+                _update(jid, stage=txt, progress=pct)
+
+            await runtime.ensure_models(pack, on_progress=_pack_progress)
+
+        await asyncio.wait_for(_run(job), timeout=JOB_TIMEOUT)
+    except asyncio.TimeoutError:
+        if jobs[jid]["status"] != "cancelled":
+            _update(
+                jid,
+                status="error",
+                stage=None,
+                error=f"执行超时：任务超过 {JOB_TIMEOUT // 60} 分钟未完成，已自动中止",
+                finished_at=time.time(),
+            )
+    except asyncio.CancelledError:
+        if jobs[jid]["status"] != "cancelled":
+            _update(jid, status="cancelled", stage=None, error="已取消", finished_at=time.time())
+        raise
+    except Exception as e:
+        if jobs[jid]["status"] != "cancelled":
+            _update(jid, status="error", stage=None, error=str(e), finished_at=time.time())
+    finally:
+        runtime.active_jobs = max(0, runtime.active_jobs - 1)
+        runtime.touch()
+
+
+async def _upload_to_comfy(http: httpx.AsyncClient, local_name: str) -> str:
+    path = MEDIA_DIR / Path(local_name).name
+    data = await asyncio.to_thread(path.read_bytes)
+    r = await http.post(f"{runtime.COMFY_URL}/upload/image", files={"image": (path.name, data)})
+    r.raise_for_status()
+    return r.json()["name"]
+
+
+async def _free_comfy_vram(http: httpx.AsyncClient) -> None:
+    """Ask ComfyUI to unload models and free CUDA cache before running FaceFusion / DreamID-V."""
+    if not runtime.warm:
         return
     try:
-        if not runtime.ready.is_set():
-            _update(jid, status="waiting_gpu")
-            # Önceki bir kapanış sürüyorsa bitmesi beklenir, sonra GPU bir kez açılır.
-            started = False
-            while not runtime.ready.is_set():
-                if jid in cancelled:
-                    # Açılışı bu iş tetiklediyse ve başka iş yoksa GPU boşuna açılıp 15 dk boşta beklemesin.
-                    if runtime.state["phase"] == "starting" and not has_pending_jobs():
-                        await runtime.stop("iş iptal edildi, GPU kapatılıyor")
-                    raise RuntimeError(CANCELLED)
-                if runtime.state["phase"] in ("off", "error"):
-                    if started:
-                        raise RuntimeError(f"GPU açılamadı: {runtime.state['detail']}")
-                    runtime.start(job["kind"] if job["kind"] in runtime.PACKS else None)  # işin modelleri ilk iner; paketsiz tür (yazıya dökme) hiçbirini beklemez
-                    started = True
-                await asyncio.sleep(2)
-        _update(jid, status="running")
-        runtime.touch()
-        if job["kind"] in runtime.PACKS and job["kind"] not in runtime.local_modes:
-            def on_wait(st):
-                if jid in cancelled:  # paket arka planda inmeye devam eder; yalnızca iş bırakılır
-                    raise RuntimeError(CANCELLED)
-                _waiting_models(jid, job["kind"], st)
-            await runtime.ensure_models(job["kind"], on_wait)
-        if runtime.warming:
-            await interrupt_comfy()
-            while runtime.warming:
-                await asyncio.sleep(0.1)
+        await http.post(
+            f"{runtime.COMFY_URL}/free",
+            json={"unload_models": True, "free_memory": True},
+            timeout=15,
+        )
+    except Exception:
+        pass
+    runtime.warm.clear()
+
+
+async def _run_faceswap(http: httpx.AsyncClient, job: dict) -> None:
+    jid = job["id"]
+    p = job.get("params") or {}
+    inputs = list(job.get("inputs") or [])
+    if len(inputs) < 2:
+        raise RuntimeError("换脸任务至少需要上传 2 个文件（前 N-1 张为源人脸图片，最后 1 个为目标图片或视频）")
+
+    source_files = inputs[:-1]
+    target_file = inputs[-1]
+    engine = p.get("engine", "facefusion_cli")
+    is_warm = "faceswap" in runtime.warm
+
+    t0 = time.time()
+    _update(jid, stage="正在释放显存与上传素材", stage_started_at=t0, stages=STAGES["faceswap"], warm=is_warm, progress=5)
+    await _free_comfy_vram(http)
+
+    remote_job_dir = f"/content/jobs/{jid}"
+    remote_in_dir = f"{remote_job_dir}/in"
+    remote_out_dir = f"{remote_job_dir}/out"
+    await runtime.ssh(f"rm -rf {shlex.quote(remote_job_dir)} && mkdir -p {shlex.quote(remote_in_dir)} {shlex.quote(remote_out_dir)}")
+
+    remote_sources: list[str] = []
+    for idx, src_name in enumerate(source_files):
+        local_src = MEDIA_DIR / Path(src_name).name
+        remote_src = f"{remote_in_dir}/src_{idx}_{local_src.name}"
+        await asyncio.to_thread(runtime.upload_file, local_src, remote_src)
+        remote_sources.append(remote_src)
+
+    local_target = MEDIA_DIR / Path(target_file).name
+    remote_target = f"{remote_in_dir}/target_{local_target.name}"
+    await asyncio.to_thread(runtime.upload_file, local_target, remote_target)
+    tracker.record_stage("faceswap", "正在释放显存与上传素材", is_warm, time.time() - t0)
+
+    t1 = time.time()
+    _update(jid, stage="正在执行换脸流水线", stage_started_at=t1, progress=20)
+    outputs: list[dict] = []
+
+    try:
+        if engine == "dreamid_v_faster":
+            ext = local_target.suffix.lower() or ".mp4"
+            remote_final = f"{remote_out_dir}/dreamid_v_faster{ext}"
+            py_code = _build_dreamid_remote_runner(
+                source_image=remote_sources[0],
+                target_media=remote_target,
+                work_dir=remote_job_dir,
+                final_output=remote_final,
+            )
+            script_local = MEDIA_DIR / f".dreamid_{jid}.py"
+            script_local.write_text(py_code, encoding="utf-8")
+            try:
+                await asyncio.to_thread(runtime.upload_file, script_local, f"{remote_job_dir}/run_dreamid.py")
+            finally:
+                script_local.unlink(missing_ok=True)
+            await runtime.ssh(f"python3 {shlex.quote(remote_job_dir)}/run_dreamid.py", timeout=JOB_TIMEOUT)
+            remote_outputs = [("dreamid_v_faster", remote_final)]
+        else:
+            spec = {
+                "source_paths": remote_sources,
+                "target_path": remote_target,
+                "output_dir": remote_out_dir,
+                "swapper_model": p.get("swapper_model", "hyperswap_1a_256"),
+                "compare_all": bool(p.get("compare_all", False)),
+                "pixel_boost": p.get("pixel_boost", "256x256"),
+                "enhancer_model": p.get("enhancer_model", "none"),
+                "enhancer_blend": int(p.get("enhancer_blend", 50)),
+            }
+            spec_local = MEDIA_DIR / f".spec_{jid}.json"
+            spec_local.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+            try:
+                await asyncio.to_thread(runtime.upload_file, spec_local, f"{remote_job_dir}/spec.json")
+            finally:
+                spec_local.unlink(missing_ok=True)
+
+            raw_out = await runtime.ssh(
+                f"python3 /content/station/faceswap_runner.py {shlex.quote(remote_job_dir)}/spec.json",
+                timeout=JOB_TIMEOUT,
+            )
+            remote_outputs = []
+            for ln in raw_out.splitlines():
+                if ln.startswith("STUDIO_OUTPUT\t"):
+                    parts = ln.split("\t", 2)
+                    if len(parts) == 3:
+                        remote_outputs.append((parts[1], parts[2]))
+            if not remote_outputs:
+                models = faceswap_runner.resolve_swapper_models(
+                    swapper_model=spec["swapper_model"],
+                    compare_all=spec["compare_all"],
+                )
+                ext = local_target.suffix.lower() or ".png"
+                remote_outputs = [
+                    (m, f"{remote_out_dir}/swap_{idx + 1}_{m}{ext}")
+                    for idx, m in enumerate(models)
+                ]
+
+        tracker.record_stage("faceswap", "正在执行换脸流水线", is_warm, time.time() - t1)
+
+        t2 = time.time()
+        _update(jid, stage="正在回传换脸结果", stage_started_at=t2, progress=85)
+        for idx, (model_name, rpath) in enumerate(remote_outputs):
+            ext = Path(rpath).suffix.lower() or local_target.suffix.lower() or ".png"
+            fname = f"{jid}_{idx + 1}_{model_name}{ext}"
+            local_out = MEDIA_DIR / fname
+            await asyncio.to_thread(runtime.download_file, rpath, local_out)
+            media_kind = "video" if ext in (".mp4", ".webm", ".mov") else "image"
+            label = faceswap_runner.MODEL_LABELS.get(model_name, model_name)
+            outputs.append({
+                "file": fname,
+                "url": f"/media/{fname}",
+                "kind": media_kind,
+                "model": model_name,
+                "label": label,
+            })
+        tracker.record_stage("faceswap", "正在回传换脸结果", is_warm, time.time() - t2)
+    finally:
         try:
-            await asyncio.wait_for(_run(job), JOB_TIMEOUT)
-        except TimeoutError:
-            # ComfyUI işi kendisi sürdürür; kesilmezse sonraki işler GPU'yu boş bulamaz.
-            await interrupt_comfy()
-            raise RuntimeError(f"Süre aşımı: iş {JOB_TIMEOUT // 60} dakikada bitmedi, durduruldu") from None
-        if jid in cancelled:  # iptal, ComfyUI'ye iş gitmeden (model hazırlığı, yükleme) geldiyse
-            raise RuntimeError(CANCELLED)
-        _update(jid, status="done", progress=1.0, finished_at=time.time())
-    except Exception as e:
-        error = CANCELLED if jid in cancelled else runtime.short_error(e)
-        _update(jid, status="error", error=error, finished_at=time.time())
+            await runtime.ssh(f"rm -rf {shlex.quote(remote_job_dir)}", timeout=30)
+        except Exception:
+            pass
+
+    runtime.warm.add("faceswap")
+    _update(jid, status="done", stage=None, progress=100, outputs=outputs, finished_at=time.time())
 
 
-async def _run(job):
-    async with ClientSession(timeout=ClientTimeout(total=600)) as http:
-        images = [await _upload(http, name) for name in job["inputs"]]
-        p = job["params"]
-        if job["kind"] == "transcribe":
-            outputs = await _execute(http, job, [workflows.transcribe(images[0], p["language"])])
-            _update(job["id"], text=outputs[0][workflows.TEXT_NODE]["text"][0].strip())
+def _build_dreamid_remote_runner(
+    *,
+    source_image: str,
+    target_media: str,
+    work_dir: str,
+    final_output: str,
+) -> str:
+    """Generate the remote execution script that slices videos into <=81 frames for DreamID-V Faster."""
+    return f"""import json, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, "/content/station")
+
+source_image = {source_image!r}
+target_media = {target_media!r}
+work_dir = Path({work_dir!r})
+final_output = Path({final_output!r})
+
+probe = subprocess.run(
+    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+     "-count_frames", "-show_entries", "stream=nb_read_frames,r_frame_rate",
+     "-of", "json", target_media],
+    capture_output=True, text=True, check=True,
+)
+info = json.loads(probe.stdout)["streams"][0]
+total_frames = int(info.get("nb_read_frames") or 81)
+num, den = (info.get("r_frame_rate") or "24/1").split("/")
+fps = float(num) / max(1.0, float(den))
+
+max_frames = {dreamid_pipeline.MAX_DREAMID_FRAMES}
+chunks = []
+cur = 0
+while cur < total_frames:
+    cnt = min(total_frames - cur, max_frames)
+    chunks.append((cur, cnt))
+    cur += cnt
+
+swapped_files = []
+for idx, (start_f, count_f) in enumerate(chunks):
+    chunk_in = work_dir / f"chunk_in_{{idx:03d}}.mp4"
+    chunk_out = work_dir / f"chunk_out_{{idx:03d}}.mp4"
+    end_f = start_f + count_f - 1
+    vf = f"select='between(n\\\\,{{start_f}}\\\\,{{end_f}})',setpts=N/({{fps}}*TB)"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", target_media, "-vf", vf, "-an",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16", str(chunk_in)],
+        check=True,
+    )
+    aligned = max(5, min(count_f, max_frames))
+    aligned = ((aligned - 1) // 4) * 4 + 1
+    subprocess.run(
+        ["python3", "/content/DreamID-V/express_adaption/wan_swapface.py",
+         "--task", "swapface", "--size", "832*480",
+         "--ckpt_dir", "/content/models/dreamid_v/Wan2.1-T2V-1.3B",
+         "--dreamidv_ckpt", "/content/models/dreamid_v/dreamidv_faster.pth",
+         "--sample_steps", "12", "--frame_num", str(aligned),
+         "--Sample_guide_scale_img", "4.0",
+         "--ref_Path", f"{{chunk_in}},{{source_image}}",
+         "--save_file", str(chunk_out)],
+        check=True,
+    )
+    swapped_files.append(chunk_out)
+
+concat_txt = work_dir / "concat.txt"
+concat_txt.write_text("\\n".join(f"file '{{p}}'" for p in swapped_files) + "\\n")
+subprocess.run(
+    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+     "-i", target_media, "-map", "0:v:0", "-map", "1:a:0?",
+     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+     "-c:a", "aac", "-shortest", str(final_output)],
+    check=True,
+)
+"""
+
+
+async def _run(job: dict) -> None:
+    jid = job["id"]
+    kind = job["kind"]
+    prompt = job["prompt"]
+    p = job["params"]
+    inputs = job["inputs"]
+
+    async with httpx.AsyncClient(timeout=60) as http:
+        if kind == "faceswap":
+            await _run_faceswap(http, job)
             return
-        if job["kind"] == "enhance":
-            wf = workflows.enhance_prompt(job["prompt"], images, random.randrange(2**32))
-            outputs = await _execute(http, job, [wf])
-            _update(job["id"], text=outputs[0][workflows.TEXT_NODE]["text"][0].strip())
-            return
-        seed = p["seed"] if p["seed"] is not None else random.randrange(2**32)
-        if job["kind"] == "video":
-            outputs = await _execute(http, job, [workflows.video_generate({**p, "prompt": job["prompt"], "seed": seed}, images)])
-            saved = [await _download(http, job["id"], f, i) for i, f in enumerate(outputs[0][workflows.SAVE_NODE]["images"])]
-            _update(job["id"], outputs=json.dumps(saved), params=json.dumps({**p, "seed": seed}))
-            return
-        if job["kind"] == "speech":
-            wf = workflows.speech_generate({**p, "text": job["prompt"], "seed": seed}, images[0] if images else None)
-            outputs = await _execute(http, job, [wf])
-            saved = [await _download(http, job["id"], f, i) for i, f in enumerate(outputs[0][workflows.SAVE_NODE]["audio"])]
-            _update(job["id"], outputs=json.dumps(saved), params=json.dumps({**p, "seed": seed}))
-            return
-        if job["kind"] == "model3d":
-            outputs = await _execute(http, job, [workflows.model3d_generate({**p, "seed": seed}, images[0])])
-            saved = [await _download(http, job["id"], f, i) for i, f in enumerate(outputs[0][workflows.SAVE_NODE]["3d"])]
-            _update(job["id"], outputs=json.dumps(saved), params=json.dumps({**p, "seed": seed}))
-            return
-        if job["kind"] == "music":
-            wf = workflows.music_generate({**p, "style": job["prompt"], "seed": seed})
-            outputs = await _execute(http, job, [wf])
-            saved = [await _download(http, job["id"], f, i) for i, f in enumerate(outputs[0][workflows.SAVE_NODE]["audio"])]
-            _update(job["id"], outputs=json.dumps(saved), params=json.dumps({**p, "seed": seed}))
-            return
-        if job["kind"] != "image":
-            raise ValueError(f"bilinmeyen iş türü: {job['kind']}")
-        graphs = []
-        for i in range(p["count"]):
-            gp = {**p, "prompt": job["prompt"], "seed": seed + i}
-            graphs.append(workflows.image_edit(gp, images) if images else workflows.image_generate(gp))
-        outputs = await _execute(http, job, graphs)
-        saved = []
-        for out in outputs:
-            for img in out[workflows.SAVE_NODE]["images"]:
-                saved.append(await _download(http, job["id"], img, len(saved)))
-        _update(job["id"], outputs=json.dumps(saved), params=json.dumps({**p, "seed": seed}))
+
+        if kind == "image":
+            uploaded = [await _upload_to_comfy(http, f) for f in inputs[:10]]
+            count = int(p.get("count", 1))
+            base_seed = p.get("seed") or random.randint(1, 2**32 - 1)
+            p["seed"] = base_seed
+            outputs: list[dict] = []
+            for i in range(count):
+                wf = workflows.image_generate(
+                    prompt,
+                    profile=p.get("profile", "krea2_noct"),
+                    ratio=p.get("ratio", "1:1"),
+                    size=p.get("size", "1536"),
+                    edit_resolution=int(p.get("edit_resolution", 1080)),
+                    steps=int(p.get("steps", 25)),
+                    cfg=float(p.get("cfg", 3.0)),
+                    sampler=p.get("sampler", "euler"),
+                    scheduler=p.get("scheduler", "simple"),
+                    turbo=bool(p.get("turbo", False)),
+                    negative=p.get("negative", ""),
+                    seed=base_seed + i,
+                    images=uploaded,
+                )
+                outs = await _exec_workflow(http, jid, kind, wf, idx=i, total=count)
+                outputs.extend(outs)
+            _update(jid, status="done", stage=None, progress=100, outputs=outputs, finished_at=time.time())
+
+        elif kind == "video":
+            first = await _upload_to_comfy(http, inputs[0]) if len(inputs) >= 1 else None
+            last = await _upload_to_comfy(http, inputs[1]) if len(inputs) >= 2 else None
+            seed = p.get("seed") or random.randint(1, 2**32 - 1)
+            p["seed"] = seed
+            wf = workflows.video_generate(
+                prompt,
+                profile=p.get("profile", "minimax_h3"),
+                ratio=p.get("ratio", "16:9"),
+                resolution=p.get("resolution", "480p"),
+                seconds=int(p.get("seconds", 5)),
+                quality=p.get("quality", "turbo"),
+                seed=seed,
+                first_frame=first,
+                last_frame=last,
+            )
+            outs = await _exec_workflow(http, jid, kind, wf)
+            _update(jid, status="done", stage=None, progress=100, outputs=outs, finished_at=time.time())
 
 
-async def _upload(http, name):
-    form = FormData()
-    form.add_field("image", (MEDIA_DIR / name).read_bytes(), filename=Path(name).name)
-    form.add_field("overwrite", "true")
-    async with http.post(f"{runtime.COMFY_URL}/upload/image", data=form) as r:
-        r.raise_for_status()
-        return (await r.json())["name"]
+async def _exec_workflow(
+    http: httpx.AsyncClient, jid: str, kind: str, wf: dict, idx: int = 0, total: int = 1
+) -> list[dict]:
+    client_id = uuid.uuid4().hex
+    ws_url = f"ws://127.0.0.1:{runtime.COMFY_PORT}/ws?clientId={client_id}"
+    titles = {nid: n.get("_meta", {}).get("title", "正在执行") for nid, n in wf.items()}
+    prefix = f"[{idx + 1}/{total}] " if total > 1 else ""
+    is_warm = kind in runtime.warm
+    cur_stage: str | None = None
+    stage_t0 = time.time()
 
+    def _enter_stage(new_stage: str) -> None:
+        nonlocal cur_stage, stage_t0
+        now = time.time()
+        if cur_stage and cur_stage != new_stage:
+            tracker.record_stage(kind, cur_stage, is_warm, now - stage_t0)
+        if cur_stage != new_stage:
+            cur_stage = new_stage
+            stage_t0 = now
+            _update(jid, stage=f"{prefix}{new_stage}", stage_started_at=now, stages=STAGES.get(kind, []), warm=is_warm)
 
-async def _download(http, jid, img, index):
-    params = {"filename": img["filename"], "subfolder": img["subfolder"], "type": img["type"]}
-    async with http.get(f"{runtime.COMFY_URL}/view", params=params) as r:
-        r.raise_for_status()
-        data = await r.read()
-    name = f"{jid}_{index}{Path(img['filename']).suffix}"
-    (MEDIA_DIR / name).write_bytes(data)
-    return name
+    _enter_stage("正在加载模型")
 
+    try:
+        ws_cm = websockets.connect(ws_url, max_size=32 * 1024 * 1024, ping_interval=20, ping_timeout=60)
+    except TypeError:
+        ws_cm = websockets.connect(ws_url, max_size=32 * 1024 * 1024)
 
-async def _execute(http, job, graphs):
-    """Grafikleri sırayla çalıştırır; ilerlemeyi ComfyUI websocket'inden okur. Kalan süre önceki
-    işlerden öğrenilen düğüm sürelerinden hesaplanır (tracker.py); iş başarıyla biterse bu işin
-    ölçümleri de öğrenilir."""
-    jid, results = job["id"], []
-    cold = job["kind"] not in runtime.warm
-    t = tracker.Tracker(timings(), job, graphs, cold)
-    live[jid] = t.snapshot
-    loaded = False  # ilk adım bitince model GPU'dadır; sonraki örnekleyiciler yükleme beklemez
-    async with http.ws_connect(f"{runtime.COMFY_URL}/ws?clientId={CLIENT_ID}") as ws:
-        for gi, graph in enumerate(graphs):
-            if jid in cancelled:  # iptal iki grafik arasında geldiyse kesilecek bir iş yoktu
-                raise RuntimeError(CANCELLED)
-            async with http.post(f"{runtime.COMFY_URL}/prompt", json={"prompt": graph, "client_id": CLIENT_ID}) as r:
-                body = await r.json()
-                if r.status != 200:
-                    raise RuntimeError(f"ComfyUI işi reddetti: {json.dumps(body)[:400]}")
-            pid = body["prompt_id"]
-            t.start_graph(gi)
-            stage = "Çalışıyor"
-            async for msg in ws:
-                if msg.type != WSMsgType.TEXT:
+    try:
+        async with ws_cm as ws:
+            r = await http.post(f"{runtime.COMFY_URL}/prompt", json={"prompt": wf, "client_id": client_id})
+            if r.status_code != 200:
+                raise RuntimeError(f"ComfyUI 拒绝了任务: {r.text[:300]}")
+            prompt_id = r.json()["prompt_id"]
+            _comfy_prompt_ids[jid] = prompt_id
+
+            while True:
+                raw = await ws.recv()
+                if isinstance(raw, bytes):
                     continue
-                ev = json.loads(msg.data)
-                data = ev.get("data", {})
-                if data.get("prompt_id") != pid:
+                msg = json.loads(raw)
+                t = msg.get("type")
+                d = msg.get("data", {})
+                if d.get("prompt_id") not in (None, prompt_id):
                     continue
-                if ev["type"] == "execution_cached":
-                    t.cached(data.get("nodes", []))
-                elif ev["type"] == "executing" and data.get("node") in graph:
-                    if jid in cancelled:
-                        # Kesme, grafik gönderilip yürütme başlamadan geldiyse ComfyUI yürütme
-                        # başında kesme bayrağını sıfırlar; düğüm başladığında yeniden kesilir.
-                        await interrupt_comfy()
-                    t.executing(data["node"])
-                    node = graph[data["node"]]
-                    stage = node.get("_meta", {}).get("title") or STAGES.get(node["class_type"], "Çalışıyor")
-                    detail = stage
-                    if node["class_type"] in tracker.SAMPLERS:  # ilk adıma kadar model yüklenir
-                        detail += " (model GPU'ya yükleniyor)" if cold and not loaded else " (başlıyor)"
-                    _update(jid, stage=detail, progress=t.snapshot()["progress"])
-                elif ev["type"] == "progress":
-                    v, mx = data["value"], data["max"]
-                    t.progress(v, mx)
-                    loaded = True
-                    sampler = graph.get(t.node, {}).get("class_type") in tracker.SAMPLERS
-                    detail = f"{stage} ({v}/{mx} adım)" if sampler else f"{stage} (%{round(100 * v / mx)})"
-                    _update(jid, progress=t.snapshot()["progress"], stage=detail)
-                elif ev["type"] == "execution_interrupted":
-                    raise RuntimeError(CANCELLED)
-                elif ev["type"] == "execution_error":
-                    raise RuntimeError(f"{data.get('exception_type')}: {data.get('exception_message', '')[:300]}")
-                elif ev["type"] == "executing" and data.get("node") is None:
-                    break
-                elif ev["type"] == "execution_success":
-                    break
-            else:
-                # Bağlantı bitiş olayı gelmeden kapandı (ComfyUI çöktü ya da SSH yönlendirmesi koptu);
-                # history'de bu işin kaydı olmaz.
-                raise RuntimeError("ComfyUI bağlantısı koptu")
-            async with http.get(f"{runtime.COMFY_URL}/history/{pid}") as r:
-                results.append((await r.json())[pid]["outputs"])
-    t.finish()
-    learn_timings(t.learned())
-    runtime.warm.add(job["kind"])
-    return results
+                if t == "executing":
+                    node = d.get("node")
+                    if node is None:
+                        break
+                    _enter_stage(titles.get(str(node), "正在执行"))
+                elif t == "progress":
+                    v, m = d.get("value", 0), max(1, d.get("max", 1))
+                    pct = int(((idx + v / m) / total) * 100)
+                    node = str(d.get("node", ""))
+                    stage = titles.get(node) or cur_stage or "正在生成"
+                    _enter_stage(stage)
+                    label = f"{prefix}{stage} ({v}/{m} 步)" if m <= 60 else f"{prefix}{stage} ({int(v * 100 / m)}%)"
+                    _update(jid, stage=label, progress=pct)
+                elif t == "execution_error":
+                    em = d.get("exception_message", "ComfyUI 执行出错")
+                    raise RuntimeError(em.strip())
+    except websockets.ConnectionClosed as e:
+        settled = await _wait_history(http, _comfy_prompt_ids.get(jid, ""), timeout=120)
+        if not settled:
+            raise RuntimeError(f"ComfyUI 连接中断: {e}") from e
+
+    if cur_stage:
+        tracker.record_stage(kind, cur_stage, is_warm, time.time() - stage_t0)
+    runtime.warm.add(kind)
+
+    hist = (await http.get(f"{runtime.COMFY_URL}/history/{prompt_id}")).json().get(prompt_id, {})
+    return await _collect_outputs(http, jid, hist.get("outputs", {}), idx)
 
 
-# --- kredi geçmişi ---
-
-def record_credits(credits):
-    last = db.execute("SELECT ts FROM credit_samples ORDER BY ts DESC LIMIT 1").fetchone()
-    if last is None or time.time() - last["ts"] >= CREDIT_SAMPLE_SECONDS:
-        db.execute("INSERT INTO credit_samples VALUES (?,?)", (time.time(), credits["balance"]))
-        db.commit()
-
-
-def _spent_since(since):
-    """Bakiyedeki düşüşlerin toplamı; artışlar (kredi satın alma) sayılmaz."""
-    rows = db.execute("SELECT balance FROM credit_samples WHERE ts >= ? ORDER BY ts", (since,)).fetchall()
-    return sum(max(0.0, a["balance"] - b["balance"]) for a, b in itertools.pairwise(rows))
-
-
-def credit_stats():
-    now = time.time()
-    first = db.execute("SELECT MIN(ts) AS ts FROM credit_samples").fetchone()["ts"]
-    if first is None:
-        return None
-    midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
-    week_start = max(first, now - 7 * 86400)
-    days = max((now - week_start) / 86400, 1 / 24)
-    week = _spent_since(week_start)
-    return {
-        "today": _spent_since(midnight),
-        "week": week,
-        "per_day": week / days,
-        "tracked_days": round(days, 1),
-    }
-
-
-ORPHAN_GRACE_SECONDS = 3600  # yeni inen dosya iş satırına yazılmadan önce sahipsiz görünebilir
-
-
-def sweep_orphans():
-    """Hiçbir işin çıktısı ya da girdisi olmayan medya dosyalarını siler (silinen sohbetin sürerken
-    biten işinin çıktısı gibi); yüklemeler (uploads/) süre dolunca ayrıca temizlenir."""
-    used = set()
-    for row in db.execute("SELECT outputs, inputs FROM jobs"):
-        used.update(json.loads(row["outputs"]))
-        used.update(json.loads(row["inputs"]))
-    removed = []
-    for f in MEDIA_DIR.iterdir():
-        if f.is_file() and f.name not in used and time.time() - f.stat().st_mtime > ORPHAN_GRACE_SECONDS:
-            f.unlink()
-            removed.append(f.name)
-    return removed
-
-
-def cleanup_once():
-    """Saklama süresi dolan sohbetleri, eski iş satırlarını, kredi örneklerini, eskimiş süre
-    anahtarlarını ve sahipsiz medyayı siler."""
-    cutoff = time.time() - RETENTION_DAYS * 86400
-    for t in db.execute("SELECT id FROM threads WHERE created_at < ?", (cutoff,)).fetchall():
-        delete_thread(t["id"])
-    db.execute("DELETE FROM jobs WHERE thread_id IS NULL AND created_at < ?", (cutoff,))
-    db.execute("DELETE FROM credit_samples WHERE ts < ?", (time.time() - 90 * 86400,))
-    db.commit()
-    prune_timings()
-    sweep_orphans()
-    for f in (MEDIA_DIR / "uploads").iterdir():
-        if f.stat().st_mtime < cutoff:
-            f.unlink()
-
-
-async def cleanup_loop():
-    """Temizliği 6 saatte bir çalıştırır. Bir turdaki hata döngüyü durdurmaz: durursa saklama
-    süresi işlemez, medya ve veritabanı büyümeye devam eder."""
-    while True:
+async def _wait_history(http: httpx.AsyncClient, prompt_id: str, timeout: int = 120) -> bool:
+    if not prompt_id:
+        return False
+    for _ in range(timeout // 2):
+        await asyncio.sleep(2)
         try:
-            cleanup_once()
-        except Exception as e:
-            runtime.log(f"temizlik turu başarısız, sonraki turda yeniden denenecek: {runtime.short_error(e, 300)}")
-        await asyncio.sleep(CLEANUP_SECONDS)
+            h = (await http.get(f"{runtime.COMFY_URL}/history/{prompt_id}")).json().get(prompt_id)
+            if h and h.get("outputs"):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _collect_outputs(http: httpx.AsyncClient, jid: str, raw_outputs: dict, idx: int) -> list[dict]:
+    collected: list[dict] = []
+    for node_out in raw_outputs.values():
+        for key in ("images", "video", "videos", "gifs"):
+            for item in node_out.get(key, []):
+                if not isinstance(item, dict) or "filename" not in item:
+                    continue
+                fn = item["filename"]
+                ext = Path(fn).suffix.lower()
+                r = await http.get(
+                    f"{runtime.COMFY_URL}/view",
+                    params={
+                        "filename": fn,
+                        "subfolder": item.get("subfolder", ""),
+                        "type": item.get("type", "output"),
+                    },
+                )
+                r.raise_for_status()
+                local_name = f"{jid}_{idx}_{len(collected)}{ext}"
+                dest = MEDIA_DIR / local_name
+                tmp = dest.with_suffix(dest.suffix + ".part")
+                tmp.write_bytes(r.content)
+                os.replace(tmp, dest)
+                kind = "video" if ext in (".mp4", ".webm", ".mov") else "image"
+                collected.append({"file": local_name, "url": f"/media/{local_name}", "kind": kind})
+    return collected

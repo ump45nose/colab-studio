@@ -3,9 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { registerRuntimeTools } from "./tools/runtime.js";
 import { registerGenerationTools } from "./tools/generation.js";
-import { registerMediaTools } from "./tools/media.js";
 import { registerStudioTools } from "./tools/studio.js";
 import { registerResources } from "./resources.js";
 import { registerPrompts } from "./prompts.js";
@@ -13,17 +11,11 @@ import { registerPrompts } from "./prompts.js";
 const SERVER_NAME = "colab-studio";
 const SERVER_VERSION = "1.0.0";
 
-/**
- * Her bağlantı kendi sunucusunu alır: tek bir `McpServer`e ikinci kez `connect` çağrısı
- * "Already connected" fırlatır ve süreci öldürürdü.
- */
 type RegisterFn = (server: McpServer) => void;
 
 function createServerFactory(): () => McpServer {
   const registrars: RegisterFn[] = [
-    registerRuntimeTools,
     registerGenerationTools,
-    registerMediaTools,
     registerStudioTools,
     registerResources,
     registerPrompts,

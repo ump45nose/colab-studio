@@ -1,115 +1,102 @@
-"""Model catalog (models.toml): which Hugging Face files each mode downloads and which file fills
-each slot of its ComfyUI workflow.
+"""Model catalog reader (`station/models.default.toml` + optional `models.toml` override).
 
-Shared by the server (workflows use the file names) and the GPU runtime (station/models.py
-downloads the files). Standard library only; Python 3.11+ (tomllib).
-
-Format (see models.default.toml):
-
-    [image]
-    label = "Noct-Q V4"                     # shown in the UI
-    description = { en = "...", tr = "..." } # optional, shown in the UI (or a plain string)
-    [image.files]
-    diffusion_model = { repo = "owner/name", file = "path/in/repo.safetensors", dir = "diffusion_models" }
-    ...
-    [[image.extra]]                          # optional: more files to download, not tied to a slot
-    repo = "owner/name"
-    file = "config.json"
-    dir = "some/folder"
+Pure standard library (`tomllib`, Python 3.11+); zero third-party dependencies so both the
+station downloader and the FastAPI server can import it directly.
 """
-import tomllib
-from pathlib import Path
+from __future__ import annotations
 
-# mode -> workflow slots that must be filled. A ComfyUI workflow loads exactly these files, so a
-# replacement must be the same architecture (e.g. another Qwen-Image 2.1 fine-tune for image).
-SLOTS = {
-    "image": ["diffusion_model", "text_encoder", "vae", "turbo_lora"],
-    "enhance": ["prompt_enhancer_t2i", "prompt_enhancer_i2i"],
-    "video": ["diffusion_model", "text_encoder", "video_vae", "audio_vae", "turbo_lora"],
-    "music": ["checkpoint"],
-    "model3d": ["diffusion_model", "clip_vision", "shape_vae", "texture_vae", "background_removal"],
-    "speech": [],
+import os
+from dataclasses import dataclass
+from pathlib import Path
+import tomllib
+
+STATION_DIR = Path(__file__).resolve().parent
+REPO_ROOT = STATION_DIR.parent
+DEFAULT_TOML = STATION_DIR / "models.default.toml"
+
+# Required model slots per pack. Removing or renaming a slot is caught by validate().
+SLOTS: dict[str, tuple[str, ...]] = {
+    "image": ("diffusion", "encoder", "vae", "turbo_lora"),
+    "image_turbo": ("diffusion", "encoder", "vae"),
+    "video": ("diffusion", "encoder", "video_vae", "audio_vae", "turbo_lora"),
+    "video_wan22": ("high_noise", "low_noise", "encoder", "vae"),
 }
 
 
-class CatalogError(ValueError):
-    pass
+@dataclass(frozen=True)
+class Entry:
+    repo: str
+    file: str       # Path inside the HuggingFace repository (may include subdirectories)
+    target: str     # Local filename under /content/models/<dir>/<target>
+    dir: str        # ComfyUI models/ subdirectory (diffusion_models, text_encoders, vae, loras)
+    size_gb: float
+    sha256: str | None = None
 
 
-def _entry(mode, where, value):
-    if not isinstance(value, dict):
-        raise CatalogError(f"{mode}.{where}: expected {{ repo = ..., file = ..., dir = ... }}")
-    missing = [k for k in ("repo", "file", "dir") if not isinstance(value.get(k), str) or not value[k].strip()]
-    if missing:
-        raise CatalogError(f"{mode}.{where}: missing {', '.join(missing)}")
-    if value["repo"].count("/") != 1:
-        raise CatalogError(f"{mode}.{where}: repo must look like 'owner/name', got {value['repo']!r}")
-    if value["dir"].startswith("/") or ".." in Path(value["dir"]).parts:
-        raise CatalogError(f"{mode}.{where}: dir must be a relative folder under ComfyUI/models")
-    return (value["repo"], value["file"], value["dir"])
+def resolve_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Catalog file priority: explicit parameter > $MODELS_TOML > ./models.toml > models.default.toml."""
+    if explicit:
+        return Path(explicit)
+    env = os.environ.get("MODELS_TOML")
+    if env:
+        return Path(env)
+    user = REPO_ROOT / "models.toml"
+    return user if user.exists() else DEFAULT_TOML
 
 
-def _text(mode, value):
-    """description: a string, or a table per UI language ({ en = "...", tr = "..." })."""
-    if isinstance(value, str):
-        return {"en": value.strip()} if value.strip() else {}
-    if isinstance(value, dict) and all(isinstance(v, str) for v in value.values()):
-        return {k: v.strip() for k, v in value.items() if v.strip()}
-    raise CatalogError(f"{mode}.description must be a string or a table like {{ en = \"...\", tr = \"...\" }}")
+def load(path: str | os.PathLike[str] | None = None) -> dict[str, dict[str, Entry]]:
+    p = resolve_path(path)
+    with open(p, "rb") as f:
+        raw = tomllib.load(f)
+    return validate(raw, source=str(p))
 
 
-def parse(data):
-    """Validated catalog: {mode: {"label", "description", "files": {slot: (repo, file, dir)}, "pack": [...]}}."""
-    unknown = set(data) - set(SLOTS)
+def validate(raw: dict, source: str = "<models.toml>") -> dict[str, dict[str, Entry]]:
+    out: dict[str, dict[str, Entry]] = {}
+    unknown = set(raw) - set(SLOTS)
     if unknown:
-        raise CatalogError(f"unknown mode(s): {', '.join(sorted(unknown))} (known: {', '.join(SLOTS)})")
-    catalog = {}
-    for mode, slots in SLOTS.items():
-        section = data.get(mode)
-        if not isinstance(section, dict):
-            raise CatalogError(f"[{mode}] section is missing")
-        files = section.get("files", {})
-        if not isinstance(files, dict):
-            raise CatalogError(f"[{mode}.files] must be a table")
-        missing = [s for s in slots if s not in files]
-        if missing:
-            raise CatalogError(f"[{mode}.files] missing slot(s): {', '.join(missing)}")
-        extra_slots = set(files) - set(slots)
-        if extra_slots:
-            raise CatalogError(f"[{mode}.files] unknown slot(s): {', '.join(sorted(extra_slots))} (expected: {', '.join(slots) or 'none, use [[' + mode + '.extra]]'})")
-        resolved = {slot: _entry(mode, f"files.{slot}", files[slot]) for slot in slots}
-        extra = section.get("extra", [])
-        if not isinstance(extra, list):
-            raise CatalogError(f"{mode}.extra must be an array of tables ([[{mode}.extra]])")
-        pack = list(resolved.values()) + [_entry(mode, f"extra[{i}]", e) for i, e in enumerate(extra)]
-        if not pack:
-            raise CatalogError(f"[{mode}] downloads no files")
-        catalog[mode] = {
-            "label": str(section.get("label", "")).strip() or mode,
-            "description": _text(mode, section.get("description", "")),
-            "files": resolved,
-            "pack": pack,
-        }
-    return catalog
+        raise ValueError(f"{source}: 未知模型包 {sorted(unknown)}（有效值：{sorted(SLOTS)}）")
+    for pack, slots in SLOTS.items():
+        sec = raw.get(pack)
+        if not isinstance(sec, dict):
+            raise ValueError(f"{source}: 缺少 [{pack}] 配置段")
+        extra = set(sec) - set(slots)
+        if extra:
+            raise ValueError(f"{source}: [{pack}] 存在未知槽位 {sorted(extra)}（预期：{list(slots)}）")
+        entries: dict[str, Entry] = {}
+        for slot in slots:
+            item = sec.get(slot)
+            if not isinstance(item, dict):
+                raise ValueError(f"{source}: 缺少 [{pack}.{slot}]")
+            for req in ("repo", "file", "dir", "size_gb"):
+                if req not in item:
+                    raise ValueError(f"{source}: [{pack}.{slot}] 缺少必填字段 '{req}'")
+            repo = item["repo"]
+            file = item["file"]
+            target = item.get("target") or Path(file).name
+            if not isinstance(repo, str) or "/" not in repo:
+                raise ValueError(f"{source}: [{pack}.{slot}].repo 必须为 'owner/name' 格式：{repo!r}")
+            if not isinstance(file, str) or not file or ".." in Path(file).parts:
+                raise ValueError(f"{source}: [{pack}.{slot}].file 非法：{file!r}")
+            if not isinstance(target, str) or "/" in target or "\\" in target or target in ("", ".", ".."):
+                raise ValueError(f"{source}: [{pack}.{slot}].target 必须为纯文件名：{target!r}")
+            try:
+                size = float(item["size_gb"])
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"{source}: [{pack}.{slot}].size_gb 必须为数字") from e
+            if size <= 0:
+                raise ValueError(f"{source}: [{pack}.{slot}].size_gb 必须大于 0")
+            sha = item.get("sha256")
+            if sha is not None and (not isinstance(sha, str) or len(sha) != 64):
+                raise ValueError(f"{source}: [{pack}.{slot}].sha256 必须为 64 位十六进制字符串")
+            entries[slot] = Entry(
+                repo=repo, file=file, target=target,
+                dir=str(item["dir"]), size_gb=size, sha256=sha,
+            )
+        out[pack] = entries
+    return out
 
 
-def load(path):
-    path = Path(path)
-    try:
-        data = tomllib.loads(path.read_text())
-    except tomllib.TOMLDecodeError as e:
-        raise CatalogError(f"{path}: {e}") from None
-    try:
-        return parse(data)
-    except CatalogError as e:
-        raise CatalogError(f"{path}: {e}") from None
-
-
-def filename(catalog, mode, slot):
-    """Name ComfyUI sees: the file's base name inside its models/<dir> folder."""
-    return Path(catalog[mode]["files"][slot][1]).name
-
-
-def packs(catalog):
-    """mode -> [(repo, file, dir)] in download order."""
-    return {mode: entry["pack"] for mode, entry in catalog.items()}
+def file_names(pack: str, path: str | os.PathLike[str] | None = None) -> dict[str, str]:
+    """Return {slot: ComfyUI local filename} for server/workflows.py."""
+    return {slot: e.target for slot, e in load(path)[pack].items()}

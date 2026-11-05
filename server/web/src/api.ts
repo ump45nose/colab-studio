@@ -1,265 +1,176 @@
-import { t, tServer } from "./i18n";
-export type Phase = "off" | "starting" | "ready" | "stopping" | "error";
+import { t } from "./i18n";
 
-export interface Credits {
-  balance?: number;
-  rate?: number;
+export type Mode = "image" | "video" | "faceswap";
+
+export type ImageProfile = "krea2_noct" | "z_image_turbo_nsfw";
+export type VideoProfile = "minimax_h3" | "wan22_remix";
+export type FaceSwapEngine = "facefusion_cli" | "dreamid_v_faster";
+export type SwapperModel = "hyperswap_1a_256" | "alphaface_256" | "inswapper_128_fp16";
+export type PixelBoost = "256x256" | "512x512" | "768x768" | "1024x1024";
+export type EnhancerModel = "none" | "codeformer" | "gfpgan_1.4";
+
+export interface PackStatus {
+  ready: boolean;
+  total_gb: number;
+  done_gb: number;
+  current: string | null;
+  writing?: boolean;
   error?: string;
 }
 
-/** Bir model paketinin inme durumu (bayt); eta: öndeki paketlerle birlikte kalan sn. */
-export interface PackStatus {
+export interface RuntimeStatus {
+  state: "off" | "starting" | "ready" | "stopping" | "error";
+  step: string;
+  error: string | null;
+  gpu_tier: string;
+  gpu_name: string | null;
+  vram_used_mb: number;
+  vram_total_mb: number;
+  disk_free_gb: number;
+  disk_total_mb?: number;
+  disk_total_gb: number;
+  models: { packs?: Record<string, PackStatus> };
+  setup_step: string | null;
+  uptime_s: number;
+  idle_s: number;
+  idle_timeout_s: number;
+  active_jobs: number;
+  warm: string[];
+  log: string[];
+}
+
+export interface Chat {
+  id: string;
+  mode: Mode;
+  title: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface JobOutput {
+  file: string;
+  url: string;
+  kind: "image" | "video";
+  model?: string;
   label?: string;
-  total: number;
-  done: number;
-  fraction: number;
-  rate: number | null;
-  eta: number | null;
 }
-
-export interface Startup {
-  progress: number;
-  remaining_seconds: number;
-  elapsed_seconds: number;
-  step: number;
-  steps: string[];
-  step_elapsed_seconds?: number;
-  download?: PackStatus | null;
-  /** Açılışı tetikleyen işin model paketi (ilk o iner); yoksa image. */
-  pack?: string;
-  /** Kurulum betiğinin aşaması, ör. "3/5 ComfyUI ve ses paketleri kuruluyor". */
-  setup?: string | null;
-}
-
-export interface CreditStats {
-  today: number;
-  week: number;
-  per_day: number;
-  tracked_days: number;
-}
-
-export interface QueueInfo {
-  order: string[];
-  current: { id: string; kind: string; status: string; stage: string | null; progress: number; prompt: string } | null;
-  /** Sıradaki işlerin tahmini başlama süresi (sn); süre henüz öğrenilmediyse null. */
-  starts_in?: Record<string, number | null>;
-}
-
-export interface RuntimeState {
-  phase: Phase;
-  detail: string;
-  auto_shutdown: boolean;
-  idle_seconds: number | null;
-  idle_minutes: number;
-  credits: Credits | null;
-  session_spent: number | null;
-  session_seconds: number | null;
-  startup: Startup | null;
-  credit_stats: CreditStats | null;
-  queue: QueueInfo;
-  gpu: string;
-  packs?: Record<string, PackStatus>;
-  gpu_now?: { t: number; gpu: number; vram_used: number; vram_total: number } | null;
-}
-
-/** Çalışan işin canlı durumu: eta kalan sn (bu tür/ayar ilk kez çalışıyorsa null); stage_*
- * çalışan aşamanın süresi ve genelde ne kadar sürdüğü; loading: model GPU'ya yükleniyor. */
-export interface JobLive {
-  progress: number;
-  eta: number | null;
-  stage_seconds: number | null;
-  stage_expected: number | null;
-  loading: boolean;
-}
-
-export interface Metric {
-  t: number;
-  gpu: number;
-  temp: number;
-  vram_used: number;
-  vram_total: number;
-  ram_used: number;
-  ram_total: number;
-  disk_used: number;
-  disk_total: number;
-}
-
-export interface ImageParams {
-  ratio: string;
-  size: string;
-  count: number;
-  steps: number;
-  cfg: number;
-  turbo?: boolean;
-  sampler: string;
-  scheduler: string;
-  seed: number | null;
-  negative: string;
-  edit_resolution: string;
-}
-
-export interface VideoParams {
-  ratio: string;
-  quality: string;
-  seconds: number;
-  turbo: boolean;
-  seed: number | null;
-}
-
-export interface MusicParams {
-  lyrics: string;
-  seconds: number;
-  seed: number | null;
-}
-
-export interface SpeechParams {
-  engine: "chatterbox" | "qwen3";
-  language: string;
-  voice_preset: string;
-  instruct: string;
-  reference_text: string;
-  exaggeration: number;
-  cfg_weight: number;
-  temperature: number;
-  seed: number | null;
-}
-
-export interface TranscribeParams {
-  language: string;
-}
-
-export interface Model3DParams {
-  resolution: number;
-  texture: "pbr" | "vertex";
-  faces: number;
-  seed: number | null;
-}
-
-export type Mode = "image" | "video" | "model3d" | "music" | "speech" | "transcribe";
-
-export type JobStatus = "queued" | "waiting_gpu" | "running" | "done" | "error";
 
 export interface Job {
   id: string;
-  thread_id: string | null;
-  kind: Mode | "enhance";
+  chat_id: string | null;
+  kind: Mode;
   prompt: string;
-  params: Partial<ImageParams> & Partial<VideoParams> & Partial<MusicParams> & Partial<SpeechParams> & Partial<Model3DParams> & { width?: number; height?: number };
+  params: Record<string, unknown>;
   inputs: string[];
-  status: JobStatus;
-  progress: number;
-  error: string | null;
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   stage: string | null;
-  outputs: string[];
-  text: string | null;
+  stage_started_at?: number;
+  stages?: string[];
+  warm?: boolean;
+  progress: number;
+  outputs: JobOutput[];
+  error: string | null;
   created_at: number;
+  started_at: number | null;
   finished_at: number | null;
-  live?: JobLive | null;
 }
 
-export interface Thread {
-  id: string;
-  mode: string;
-  title: string;
-  created_at: number;
-}
+export type StageEstimates = Record<string, { cold: number; warm: number; samples: number }>;
+export type StartupEstimates = Record<string, { expected: number; samples: number }>;
 
-export interface ThreadDetail extends Thread {
+export interface AppState {
+  runtime: RuntimeStatus;
+  chats: Chat[];
   jobs: Job[];
+  presets: Partial<Record<Mode, Record<string, Record<string, unknown>>>>;
+  estimates: StageEstimates;
+  startup_estimates?: StartupEstimates;
 }
 
-export interface Preset {
-  id: string;
-  mode: string;
-  name: string;
-  params: ImageParams;
+export interface UsageInfo {
+  subscription_tier: string;
+  paid_balance: number;
+  free_balance: number;
+  balance: number;
+  burn_rates_hourly: Record<string, number>;
+  eligible_gpus: string[];
+  gpu_tier: string;
+  current_burn_rate: number;
+  remaining_hours_active: number | null;
+  session_used: number;
+  today_used: number;
+  daily_avg_7d: number | null;
+  days_Observed: number;
+  projected_days_left: number | null;
+  daily_history: { date: string; used: number }[];
 }
 
-/** models.toml'daki ad ve dile göre açıklama (server/app.py: /api/models). */
-export interface ModelInfo {
-  label: string;
-  description: Record<string, string>;
-}
-
-export interface Upload {
-  name: string;
-  url: string;
-}
-
-/** İsteği gönderir; ağ hatası (sunucuya hiç ulaşılamadı) da ApiError olur (status 0) ki
- * çağıranlar tek biçimde ele alsın. */
-async function send(method: string, path: string, body?: unknown, form?: FormData): Promise<Response> {
+async function req<T>(url: string, init?: RequestInit): Promise<T> {
+  let r: Response;
   try {
-    return await fetch(path, {
-      method,
-      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-      body: form ?? (body === undefined ? undefined : JSON.stringify(body)),
-    });
+    r = await fetch(url, init);
   } catch (e) {
-    throw new ApiError(0, t("Sunucuya ulaşılamadı; bağlantını kontrol edip tekrar dene. ({detail})", { detail: e instanceof Error ? e.message : String(e) }));
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new Error(t("无法连接到服务器；请检查网络连接后重试。({detail})", { detail }));
   }
-}
-
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const r = await send(method, path, body);
-  if (!r.ok) throw new ApiError(r.status, await errorText(r));
-  return r.json() as Promise<T>;
-}
-
-export class ApiError extends Error {
-  constructor(public status: number, message: string) {
-    super(message);
-  }
-}
-
-// Uygulamanın kendi hataları düz metin ya da JSON'dur; nginx'in 502 sayfası gibi HTML yanıtlar
-// (servis yeniden başlarken) ham gösterilmez. Karar gövdenin türüne göre verilir, durum koduna değil.
-async function errorText(r: Response) {
-  if (r.status === 413) return t("Dosya çok büyük (en fazla 50 MB).");
-  if (r.status >= 502) return t("Sunucuya şu an ulaşılamıyor ({status}); servis yeniden başlıyor olabilir, birazdan tekrar dene.", { status: r.status });
-  const type = (r.headers.get("content-type") ?? "").toLowerCase();
-  const text = (await r.text()).trim();
-  if (type.includes("text/html") || text.startsWith("<")) return t("Sunucu isteği işleyemedi ({status}); birazdan tekrar dene.", { status: r.status });
-  if (type.includes("json")) {
+  if (!r.ok) {
+    const text = await r.text();
+    let detail: string | null = null;
     try {
-      const j = JSON.parse(text) as Record<string, unknown>;
-      const msg = [j.error, j.detail, j.message].find((m): m is string => typeof m === "string" && m.trim() !== "");
-      if (msg) return tServer(msg);
+      const j = JSON.parse(text);
+      if (j && typeof j.detail === "string") detail = j.detail;
     } catch {
-      // JSON çözülemediyse gövdenin kısa hâli aşağıda gösterilir.
+      /* non-JSON body */
     }
+    if (detail) throw new Error(t(detail));
+    if (r.status === 413) throw new Error(t("文件过大（上限 200 MB）。"));
+    if (r.status === 502 || r.status === 503 || r.status === 504) {
+      throw new Error(t("服务器暂时不可达 ({status})；服务可能正在重启，请稍后重试。", { status: r.status }));
+    }
+    throw new Error(t("服务器未能处理请求 ({status})；请稍后重试。", { status: r.status }));
   }
-  return tServer(text.slice(0, 300)) || `${r.status} ${r.statusText}`;
+  return r.json();
 }
 
 export const api = {
-  runtime: () => call<RuntimeState>("GET", "/api/runtime"),
-  runtimeAction: (action: "start" | "stop" | "toggle-auto") =>
-    call<RuntimeState>("POST", `/api/runtime/${action}`),
-  metrics: () => call<Metric[]>("GET", "/api/runtime/metrics"),
-  runtimeLog: () => call<{ lines: string[] }>("GET", "/api/runtime/log"),
-  threads: (mode: string) => call<Thread[]>("GET", `/api/threads?mode=${mode}`),
-  thread: (id: string) => call<ThreadDetail>("GET", `/api/threads/${id}`),
-  deleteThread: (id: string) => call<{ ok: boolean }>("DELETE", `/api/threads/${id}`),
-  createJob: (body: { thread_id: string | null; kind: Job["kind"]; prompt: string; params?: ImageParams | VideoParams | Model3DParams | MusicParams | SpeechParams | TranscribeParams; inputs: string[] }) =>
-    call<Job>("POST", "/api/jobs", body),
-  job: (id: string): Promise<Job> => call<Job>("GET", `/api/jobs/${id}`),
-  // İptal ucu iptal edilen işin son hâlini döndürür ({ok} değil).
-  cancelJob: (id: string): Promise<Job> => call<Job>("POST", `/api/jobs/${id}/cancel`),
-  models: () => call<Record<string, ModelInfo>>("GET", "/api/models"),
-  settings: () => call<Record<string, unknown>>("GET", "/api/settings"),
-  saveSetting: (key: string, value: unknown) => call<{ ok: boolean }>("PUT", `/api/settings/${key}`, value),
-  presets: (mode: string) => call<Preset[]>("GET", `/api/presets?mode=${mode}`),
-  savePreset: (mode: string, name: string, params: ImageParams) =>
-    call<{ id: string }>("POST", "/api/presets", { mode, name, params }),
-  deletePreset: (id: string) => call<{ ok: boolean }>("DELETE", `/api/presets/${id}`),
-  upload: async (file: File): Promise<Upload> => {
-    const form = new FormData();
-    form.append("file", file);
-    const r = await send("POST", "/api/uploads", undefined, form);
-    if (!r.ok) throw new ApiError(r.status, await errorText(r));
-    return r.json();
+  state: () => req<AppState>("/api/state"),
+  startGpu: () => req<RuntimeStatus>("/api/runtime/start", { method: "POST" }),
+  stopGpu: () => req<RuntimeStatus>("/api/runtime/stop", { method: "POST" }),
+  usage: () => req<UsageInfo>("/api/usage"),
+  newChat: (mode: Mode, title = "") =>
+    req<Chat>("/api/chats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, title }),
+    }),
+  deleteChat: (id: string) => req<{ ok: boolean }>(`/api/chats/${id}`, { method: "DELETE" }),
+  createJob: (body: {
+    chat_id?: string | null;
+    kind: Mode;
+    prompt: string;
+    params?: Record<string, unknown>;
+    inputs?: string[];
+  }) =>
+    req<Job>("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  cancelJob: (id: string) => req<Job>(`/api/jobs/${id}/cancel`, { method: "POST" }),
+  savePreset: (mode: Mode, name: string, params: Record<string, unknown>) =>
+    req<Record<string, Record<string, unknown>>>(`/api/presets/${mode}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, params }),
+    }),
+  deletePreset: (mode: Mode, name: string) =>
+    req<Record<string, Record<string, unknown>>>(
+      `/api/presets/${mode}/${encodeURIComponent(name)}`,
+      { method: "DELETE" }
+    ),
+  upload: async (file: File): Promise<{ file: string; url: string; kind: "image" | "video" }> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return req("/api/upload", { method: "POST", body: fd });
   },
 };
-
-export const mediaUrl = (name: string) => `/media/${name}`;

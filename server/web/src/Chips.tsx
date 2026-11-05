@@ -1,207 +1,432 @@
-import { t } from "./i18n";
-import type { ImageParams, Model3DParams, MusicParams, Preset, SpeechParams, TranscribeParams, VideoParams } from "./api";
+import { Bookmark, Clock, Layers, SlidersHorizontal, Zap } from "lucide-react";
+import {
+  EnhancerModel,
+  FaceSwapEngine,
+  ImageProfile,
+  Mode,
+  PixelBoost,
+  StageEstimates,
+  SwapperModel,
+  VideoProfile,
+} from "./api";
+import { fmtDuration } from "./format";
+import { t, useLang } from "./i18n";
 
-// Düzenlemede referans ve çıktının küçültüleceği boyut; çarpan 1080p'ye göre adım başına süre
-// (L4'te SageAttention ile ölçüldü, CFG 3; Hızlı/Turbo modda CFG 1). Referans da çıktıyla birlikte işlendiği için büyür.
-export const EDIT_RESOLUTIONS: [string, string, string][] = [
-  ["720p", "~0.2x", t("~{n} sn/adım", { n: 1.5 })], ["1080p", "1x", t("~{n} sn/adım", { n: 7.8 })], ["1440p", "~1.2x", t("~{n} sn/adım", { n: 9.1 })], ["2160p", "~10x", t("~78 sn/adım (CFG 1: ~16 sn)")],
-];
-
-// L4'te ölçülen süresi 30 dk'lık iş sınırını aşan ayarlar (sunucu da reddeder, server/app.py); Turbo önerilir.
-export function tooSlowReason(mode: string, video: VideoParams, image: ImageParams, editing: boolean): string | null {
-  if (mode === "video" && video.quality === "768p" && video.seconds > 8 && !video.turbo) {
-    return t("768p Kaliteli video 8 sn'den uzunsa 30 dk sınırını aşar (9 sn ~31 dk, 10 sn ~35 dk): Turbo'yu seç ya da süreyi 8 sn'ye indir.");
-  }
-  if (mode === "image" && editing && image.edit_resolution === "2160p" && image.cfg > 1) {
-    return t("2160p düzenleme CFG > 1 ile ~33 dk sürer, 30 dk sınırını aşar: Turbo'yu (CFG 1) seç ya da çözünürlüğü düşür.");
-  }
-  return null;
+export interface ImageSettings {
+  profile: ImageProfile;
+  ratio: string;
+  size: string;
+  edit_resolution: number;
+  steps: number;
+  cfg: number;
+  sampler: string;
+  scheduler: string;
+  turbo: boolean;
+  negative: string;
+  count: number;
+  seed: string;
 }
 
-// Yeni görsel boyutları; çarpan 1.5K'ya göre adım başına süre (L4'te SageAttention ile ölçüldü, CFG 3).
-export const IMAGE_SIZES: [string, string, string, string][] = [
-  ["1K", "~1 MP", "~0.6x", t("~{n} sn/adım", { n: 1.4 })], ["1.5K", "~1.6 MP", "1x", t("~{n} sn/adım", { n: 2.3 })], ["2K", "~4 MP", "~3.4x", t("~{n} sn/adım", { n: 8 })],
+export interface VideoSettings {
+  profile: VideoProfile;
+  ratio: string;
+  resolution: string;
+  seconds: number;
+  quality: string;
+  seed: string;
+}
+
+export interface FaceSwapSettings {
+  engine: FaceSwapEngine;
+  swapper_model: SwapperModel;
+  compare_all: boolean;
+  pixel_boost: PixelBoost;
+  enhancer_model: EnhancerModel;
+  enhancer_blend: number;
+}
+
+export const DEFAULT_IMAGE: ImageSettings = {
+  profile: "krea2_noct",
+  ratio: "1:1",
+  size: "1536",
+  edit_resolution: 1080,
+  steps: 25,
+  cfg: 3.0,
+  sampler: "euler",
+  scheduler: "simple",
+  turbo: false,
+  negative: "",
+  count: 1,
+  seed: "",
+};
+
+export const DEFAULT_VIDEO: VideoSettings = {
+  profile: "minimax_h3",
+  ratio: "16:9",
+  resolution: "480p",
+  seconds: 5,
+  quality: "turbo",
+  seed: "",
+};
+
+export const DEFAULT_FACESWAP: FaceSwapSettings = {
+  engine: "facefusion_cli",
+  swapper_model: "hyperswap_1a_256",
+  compare_all: false,
+  pixel_boost: "256x256",
+  enhancer_model: "none",
+  enhancer_blend: 50,
+};
+
+export const IMAGE_RATIOS = ["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9"];
+export const VIDEO_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
+
+export const IMAGE_SIZE_INFO: Record<string, { label: string; mpx: string; mult: number; secPerStep: string }> = {
+  "1024": { label: "1K (1024)", mpx: "1.0 MP", mult: 0.45, secPerStep: "~1 秒/步" },
+  "1536": { label: "1.5K (1536)", mpx: "2.4 MP", mult: 1.0, secPerStep: "~2.2 秒/步" },
+  "2048": { label: "2K (2048)", mpx: "4.2 MP", mult: 2.1, secPerStep: "~4.6 秒/步" },
+};
+
+export const EDIT_RES_INFO: Record<number, { label: string; mult: number; secPerStep: string }> = {
+  1080: { label: "1080p", mult: 3.6, secPerStep: "~8 秒/步" },
+  1440: { label: "1440p", mult: 8.5, secPerStep: "~19 秒/步" },
+  2160: { label: "2160p (4K)", mult: 35.0, secPerStep: "~78 秒/步 (CFG 1: ~16 秒)" },
+};
+
+export const SWAPPER_MODEL_INFO: { id: SwapperModel; label: string; note: string }[] = [
+  { id: "hyperswap_1a_256", label: "HyperSwap 1A 256", note: "推荐主力 · 256原生分辨率，肤色光影过渡自然" },
+  { id: "alphaface_256", label: "AlphaFace 256", note: "大侧脸与夸张表情增强对照" },
+  { id: "inswapper_128_fp16", label: "InSwapper 128 FP16", note: "经典极速基线 · 128基础分辨率" },
 ];
 
-// TRELLIS.2 şekil ızgarası ve doku türü; toplam süreler L4'te SageAttention ile PBR doku için ölçüldü
-// (modeller yüklüyken, kahve fincanı). Köşe boyama çoğunlukla ~1 dk'ya kadar kısa: doku pişirme
-// adımları (UV, normal, AO, bake) yok (1024'te ölçüm: köşe boyama 113–173 sn, PBR 162 sn).
-export const MODEL3D_RESOLUTIONS: [number, string][] = [[1024, t("~{n} dk", { n: 2.5 })], [1536, t("~{n} dk", { n: 5 })], [2048, t("~{n} dk", { n: 12 })]];
-export const MODEL3D_TEXTURES: [Model3DParams["texture"], string, string][] = [
-  ["pbr", t("PBR doku"), t("UV açılır; renk, metalik, pürüzlülük, normal ve gölge haritaları pişirilir. Oyun motorlarına ve Blender'a hazır; UV, normal ve AO pişirme adımları süreyi uzatır.")],
-  ["vertex", t("Köşe boyama"), t("Renkler doğrudan üçgen köşelerine boyanır; doku pişirme adımları olmadığı için çoğunlukla ~1 dk'ya kadar kısa sürer. Dosya küçük, ama ayrıntı üçgen sayısıyla sınırlı.")],
-];
-export const MODEL3D_FACES = [50000, 200000, 500000, 1000000];
-export const DEFAULT_MODEL3D_PARAMS: Model3DParams = { resolution: 1024, texture: "pbr", faces: 200000, seed: null };
-export const facesLabel = (n: number) => (n >= 1000000 ? `${n / 1000000}M` : `${n / 1000}K`);
+export const PIXEL_BOOST_OPTIONS: PixelBoost[] = ["256x256", "512x512", "768x768", "1024x1024"];
 
-export function Model3DChips({ params, setParams }: { params: Model3DParams; setParams: (p: Model3DParams) => void }) {
+export const ENHANCER_OPTIONS: { id: EnhancerModel; label: string }[] = [
+  { id: "none", label: "关闭增强（底模直出）" },
+  { id: "codeformer", label: "CodeFormer" },
+  { id: "gfpgan_1.4", label: "GFPGAN 1.4" },
+];
+
+interface Props {
+  mode: Mode;
+  img: ImageSettings;
+  onImg: (s: ImageSettings) => void;
+  vid: VideoSettings;
+  onVid: (s: VideoSettings) => void;
+  fswap: FaceSwapSettings;
+  onFswap: (s: FaceSwapSettings) => void;
+  attachmentCount: number;
+  estimates: StageEstimates;
+  warm: string[];
+  presets: Record<string, Record<string, unknown>>;
+  onApplyPreset: (p: Record<string, unknown>) => void;
+  onOpenSettings: () => void;
+}
+
+export function estimateCurrent(
+  mode: Mode,
+  img: ImageSettings,
+  vid: VideoSettings,
+  fswap: FaceSwapSettings,
+  attachmentCount: number,
+  estimates: StageEstimates,
+  warm: string[]
+): { sec: number; warn?: string } {
+  const isWarm = warm.includes(mode);
+  const pick = (stage: string, fallback: number) => {
+    const e = estimates[`${mode}:${stage}`];
+    if (!e) return fallback;
+    return isWarm ? e.warm : e.cold;
+  };
+
+  if (mode === "image") {
+    const load = pick("正在加载模型", isWarm ? 2 : 28);
+    const enc = pick("正在编码提示词", 5) + (attachmentCount > 0 ? pick("正在读取参考图", 3) : 0);
+    const baseGen = pick("正在生成", 55);
+    const isZTurbo = img.profile === "z_image_turbo_nsfw" && attachmentCount === 0;
+    const stepRatio = (isZTurbo ? 8 : img.steps) / 25;
+    const cfgRatio = isZTurbo || img.cfg <= 1 ? 0.5 : 1.0;
+    const sizeMult =
+      attachmentCount > 0
+        ? EDIT_RES_INFO[img.edit_resolution]?.mult ?? 3.6
+        : IMAGE_SIZE_INFO[img.size]?.mult ?? 1.0;
+    const single = enc + baseGen * stepRatio * cfgRatio * sizeMult + pick("正在保存", 3);
+    const total = load + single * img.count;
+    const warn =
+      attachmentCount > 0 && img.edit_resolution === 2160 && img.cfg > 1 && img.steps >= 20
+        ? t("2160p 编辑在 CFG > 1 时耗时约 33 分钟，超出 30 分钟上限：请选择 Turbo (CFG 1) 或降低分辨率。")
+        : undefined;
+    return { sec: total, warn };
+  }
+
+  if (mode === "video") {
+    const load = pick("正在加载模型", isWarm ? 3 : 50);
+    const enc = pick("正在编码提示词", 12);
+    const resMult = vid.resolution === "768p" ? 2.7 : 1.0;
+    const qualMult = vid.quality === "quality" ? 2.5 : 1.0;
+    const lenMult = vid.seconds / 5;
+    const profMult = vid.profile === "wan22_remix" ? 1.15 : 1.0;
+    const gen = 180 * resMult * qualMult * lenMult * profMult;
+    const warn =
+      vid.resolution === "768p" && vid.quality === "quality" && vid.seconds > 8
+        ? t("768p 高画质视频超过 8 秒会超出 30 分钟上限：请选择 Turbo 或将时长缩短至 8 秒以内。")
+        : undefined;
+    return { sec: load + enc + gen + 12, warn };
+  }
+
+  const baseSwap = fswap.engine === "dreamid_v_faster" ? 160 : 35;
+  const modelMult = fswap.compare_all && fswap.engine === "facefusion_cli" ? 2.8 : 1.0;
+  const boostMult = fswap.pixel_boost === "1024x1024" ? 2.2 : fswap.pixel_boost === "768x768" ? 1.7 : fswap.pixel_boost === "512x512" ? 1.3 : 1.0;
+  const enhMult = fswap.enhancer_model !== "none" ? 1.35 : 1.0;
+  return { sec: 6 + baseSwap * modelMult * boostMult * enhMult };
+}
+
+export default function Chips({
+  mode,
+  img,
+  onImg,
+  vid,
+  onVid,
+  fswap,
+  onFswap,
+  attachmentCount,
+  estimates,
+  warm,
+  presets,
+  onApplyPreset,
+  onOpenSettings,
+}: Props) {
+  useLang();
+  const isEditing = mode === "image" && attachmentCount > 0;
+  const est = estimateCurrent(mode, img, vid, fswap, attachmentCount, estimates, warm);
+  const presetNames = Object.keys(presets);
+
+  const toggleImageTurbo = () => {
+    const next = !img.turbo;
+    onImg(
+      next
+        ? { ...img, turbo: true, steps: 8, cfg: 1.0, sampler: "euler", scheduler: "simple" }
+        : { ...img, turbo: false, steps: 25, cfg: 3.0 }
+    );
+  };
+
   return (
     <>
-      <select className="chip" value={params.resolution} onChange={(e) => setParams({ ...params, resolution: Number(e.target.value) })} title={t("Şekil çözünürlüğü")}>
-        {MODEL3D_RESOLUTIONS.map(([r, t]) => <option key={r} value={r}>{r} · {t}</option>)}
-      </select>
-      <select className="chip" value={params.texture} onChange={(e) => setParams({ ...params, texture: e.target.value as Model3DParams["texture"] })} title={t("Doku")}>
-        {MODEL3D_TEXTURES.map(([k, label]) => <option key={k} value={k}>{label}</option>)}
-      </select>
-      <select className="chip" value={params.faces} onChange={(e) => setParams({ ...params, faces: Number(e.target.value) })} title={t("Üçgen sayısı")}>
-        {MODEL3D_FACES.map((n) => <option key={n} value={n}>{t("{n} üçgen", { n: facesLabel(n) })}</option>)}
-      </select>
+      <div className="chips-row">
+        {mode === "image" && (
+          <>
+            <Select
+              label={t("工作流")}
+              value={isEditing ? "krea2_noct" : img.profile}
+              options={["krea2_noct", "z_image_turbo_nsfw"]}
+              display={(v) => (v === "z_image_turbo_nsfw" ? "Z-Image-Turbo (8步)" : "Krea2-Noct V4 (全能)")}
+              onChange={(v) => {
+                const prof = v as ImageProfile;
+                if (prof === "z_image_turbo_nsfw") {
+                  onImg({ ...img, profile: prof, steps: 8, cfg: 1.0, sampler: "res_multistep", scheduler: "simple", turbo: false });
+                } else {
+                  onImg({ ...img, profile: prof, steps: 25, cfg: 3.0, sampler: "euler", scheduler: "simple" });
+                }
+              }}
+            />
+            {img.profile === "krea2_noct" && (
+              <button
+                type="button"
+                className={`chip chip-toggle ${img.turbo ? "on" : ""}`}
+                onClick={toggleImageTurbo}
+                title={t("Turbo LoRA：8 步极速生成（约快 5 倍）")}
+              >
+                <Zap size={12} /> Turbo
+              </button>
+            )}
+            {!isEditing ? (
+              <>
+                <Select
+                  label={t("比例")}
+                  value={img.ratio}
+                  options={IMAGE_RATIOS}
+                  onChange={(v) => onImg({ ...img, ratio: v })}
+                />
+                <Select
+                  label={t("分辨率")}
+                  value={img.size}
+                  options={["1024", "1536", "2048"]}
+                  display={(v) => IMAGE_SIZE_INFO[v]?.label ?? v}
+                  onChange={(v) => onImg({ ...img, size: v })}
+                />
+              </>
+            ) : (
+              <Select
+                label={t("编辑分辨率")}
+                value={String(img.edit_resolution)}
+                options={["1080", "1440", "2160"]}
+                display={(v) => `${v}p`}
+                onChange={(v) => onImg({ ...img, edit_resolution: Number(v) })}
+              />
+            )}
+            <Select
+              label={t("张数")}
+              value={String(img.count)}
+              options={["1", "2", "3", "4"]}
+              display={(v) => `${v} ${t("张")}`}
+              onChange={(v) => onImg({ ...img, count: Number(v) })}
+            />
+          </>
+        )}
+
+        {mode === "video" && (
+          <>
+            <Select
+              label={t("工作流")}
+              value={vid.profile}
+              options={["minimax_h3", "wan22_remix"]}
+              display={(v) => (v === "wan22_remix" ? "Wan2.2-Remix (双阶段FP8)" : "MiniMax-H3 (音画同步)")}
+              onChange={(v) => onVid({ ...vid, profile: v as VideoProfile })}
+            />
+            <Select
+              label={t("比例")}
+              value={vid.ratio}
+              options={VIDEO_RATIOS}
+              onChange={(v) => onVid({ ...vid, ratio: v })}
+            />
+            <Select
+              label={t("分辨率")}
+              value={vid.resolution}
+              options={["480p", "768p"]}
+              onChange={(v) => onVid({ ...vid, resolution: v })}
+            />
+            <Select
+              label={t("时长")}
+              value={String(vid.seconds)}
+              options={["3", "5", "8", "10"]}
+              display={(v) => `${v}s`}
+              onChange={(v) => onVid({ ...vid, seconds: Number(v) })}
+            />
+            <button
+              type="button"
+              className={`chip chip-toggle ${vid.quality === "turbo" ? "on" : ""}`}
+              onClick={() => onVid({ ...vid, quality: vid.quality === "turbo" ? "quality" : "turbo" })}
+              title={t("Turbo：8 步快速生成；精细：20 步高连贯度")}
+            >
+              <Zap size={12} /> {vid.quality === "turbo" ? "Turbo" : t("精细")}
+            </button>
+          </>
+        )}
+
+        {mode === "faceswap" && (
+          <>
+            <Select
+              label={t("换脸引擎")}
+              value={fswap.engine}
+              options={["facefusion_cli", "dreamid_v_faster"]}
+              display={(v) => (v === "dreamid_v_faster" ? "DreamID-V Faster (81帧切片)" : "FaceFusion CLI (主力)")}
+              onChange={(v) => onFswap({ ...fswap, engine: v as FaceSwapEngine })}
+            />
+            {fswap.engine === "facefusion_cli" && (
+              <>
+                <button
+                  type="button"
+                  className={`chip chip-toggle ${fswap.compare_all ? "on" : ""}`}
+                  onClick={() => onFswap({ ...fswap, compare_all: !fswap.compare_all })}
+                  title={t("同一管道依次运行 HyperSwap 1A / AlphaFace / InSwapper 三个底模并排对比")}
+                >
+                  <Layers size={12} /> {t("三底模对比")}
+                </button>
+                {!fswap.compare_all && (
+                  <Select
+                    label={t("换脸底模")}
+                    value={fswap.swapper_model}
+                    options={SWAPPER_MODEL_INFO.map((m) => m.id)}
+                    display={(v) => SWAPPER_MODEL_INFO.find((m) => m.id === v)?.label ?? v}
+                    onChange={(v) => onFswap({ ...fswap, swapper_model: v as SwapperModel })}
+                  />
+                )}
+                <Select
+                  label={t("超分倍率")}
+                  value={fswap.pixel_boost}
+                  options={PIXEL_BOOST_OPTIONS}
+                  display={(v) => `Boost ${v}`}
+                  onChange={(v) => onFswap({ ...fswap, pixel_boost: v as PixelBoost })}
+                />
+                <Select
+                  label={t("后处理增强")}
+                  value={fswap.enhancer_model}
+                  options={ENHANCER_OPTIONS.map((e) => e.id)}
+                  display={(v) => {
+                    const found = ENHANCER_OPTIONS.find((e) => e.id === v);
+                    if (!found) return v;
+                    return v === "none" ? t(found.label) : `${found.label} (${fswap.enhancer_blend}%)`;
+                  }}
+                  onChange={(v) => onFswap({ ...fswap, enhancer_model: v as EnhancerModel })}
+                />
+              </>
+            )}
+          </>
+        )}
+
+        {presetNames.length > 0 && (
+          <label className="chip" title={t("应用已保存的预设")}>
+            <Bookmark size={11} />
+            <select
+              value=""
+              aria-label={t("预设")}
+              onChange={(e) => {
+                const p = presets[e.target.value];
+                if (p) onApplyPreset(p);
+              }}
+            >
+              <option value="" disabled>
+                {t("预设")}
+              </option>
+              {presetNames.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+
+        <span className="chip-eta" title={t("基于历史阶段耗时的预计总时长")}>
+          <Clock size={11} /> ~{fmtDuration(est.sec)}
+        </span>
+
+        <button
+          type="button"
+          className="chip chip-btn"
+          onClick={onOpenSettings}
+          title={t("打开详细参数设置")}
+        >
+          <SlidersHorizontal size={12} /> {t("参数")}
+        </button>
+      </div>
+      {est.warn && <div className="chips-warn">{est.warn}</div>}
     </>
   );
 }
 
-const IMAGE_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9"];
-const VIDEO_RATIOS = ["16:9", "9:16", "1:1"];
-// Süre aralıkları; ayar kaydırıcısı da bunları kullanır. Çipte her kaydırıcı değeri bir seçenek olsun diye aynı aralıktan üretilir.
-export const VIDEO_SECONDS_RANGE = { min: 2, max: 10, step: 1 };
-export const MUSIC_SECONDS_RANGE = { min: 10, max: 360, step: 10 };
-const rangeValues = ({ min, max, step }: { min: number; max: number; step: number }) =>
-  Array.from({ length: (max - min) / step + 1 }, (_, i) => min + i * step);
-const VIDEO_SECONDS = rangeValues(VIDEO_SECONDS_RANGE);
-
-export const DEFAULT_MUSIC_PARAMS: MusicParams = { lyrics: "", seconds: 120, seed: null };
-const MUSIC_SECONDS = rangeValues(MUSIC_SECONDS_RANGE);
-const musicLabel = (s: number) => (s < 60 ? t("{n} sn", { n: s }) : s % 60 ? t("{m} dk {s} sn", { m: Math.floor(s / 60), s: s % 60 }) : t("{n} dk", { n: s / 60 }));
-
-export function MusicChips({ params, setParams }: { params: MusicParams; setParams: (p: MusicParams) => void }) {
-  return (
-    <select className="chip" value={params.seconds} onChange={(e) => setParams({ ...params, seconds: Number(e.target.value) })} title={t("En uzun süre")}>
-      {MUSIC_SECONDS.map((s) => <option key={s} value={s}>{t("en çok {d}", { d: musicLabel(s) })}</option>)}
-    </select>
-  );
-}
-
-export const DEFAULT_VIDEO_PARAMS: VideoParams = { ratio: "16:9", quality: "480p", seconds: 5, turbo: true, seed: null };
-
-export function ImageChips({ params, setParams, presets, editing }: {
-  params: ImageParams;
-  setParams: (p: ImageParams) => void;
-  presets: Preset[];
-  editing: boolean;
+function Select({
+  value,
+  options,
+  display,
+  onChange,
+  label,
+}: {
+  value: string;
+  options: string[];
+  display?: (v: string) => string;
+  onChange: (v: string) => void;
+  label?: string;
 }) {
   return (
-    <>
-      {!editing && (
-        <select className="chip" value={params.ratio} onChange={(e) => setParams({ ...params, ratio: e.target.value })} title={t("En-boy oranı")}>
-          {IMAGE_RATIOS.map((r) => <option key={r} value={r}>{r}</option>)}
-        </select>
-      )}
-      {editing ? (
-        <select
-          className="chip"
-          value={params.edit_resolution}
-          onChange={(e) => setParams({ ...params, edit_resolution: e.target.value })}
-          title={t("Düzenleme çözünürlüğü: referans görsel ve sonuç bu boyuta küçültülür")}
-        >
-          {EDIT_RESOLUTIONS.map(([r, x]) => <option key={r} value={r}>{r} · {x}</option>)}
-        </select>
-      ) : (
-        <select className="chip" value={params.size} onChange={(e) => setParams({ ...params, size: e.target.value })} title={t("Çözünürlük")}>
-          {IMAGE_SIZES.map(([k, , x]) => <option key={k} value={k}>{k} · {x}</option>)}
-        </select>
-      )}
-      <select className="chip" value={params.count} onChange={(e) => setParams({ ...params, count: Number(e.target.value) })} title={t("Adet")}>
-        {[1, 2, 3, 4].map((n) => <option key={n} value={n}>{t("{n} adet", { n })}</option>)}
+    <label className="chip" title={label}>
+      <select value={value} onChange={(e) => onChange(e.target.value)} aria-label={label}>
+        {options.map((o) => (
+          <option key={o} value={o}>
+            {display ? display(o) : o}
+          </option>
+        ))}
       </select>
-      <select
-        className="chip"
-        value=""
-        title={t("Ön ayar uygula")}
-        onChange={(e) => {
-          const p = presets.find((x) => x.id === e.target.value);
-          if (p) setParams({ ...p.params });
-        }}
-      >
-        <option value="">{t("Ön ayar")}</option>
-        {presets.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-      </select>
-    </>
-  );
-}
-
-export function VideoChips({ params, setParams }: { params: VideoParams; setParams: (p: VideoParams) => void }) {
-  return (
-    <>
-      <select className="chip" value={params.ratio} onChange={(e) => setParams({ ...params, ratio: e.target.value })} title={t("En-boy oranı")}>
-        {VIDEO_RATIOS.map((r) => <option key={r} value={r}>{r}</option>)}
-      </select>
-      <select className="chip" value={params.quality} onChange={(e) => setParams({ ...params, quality: e.target.value })} title={t("Çözünürlük")}>
-        <option value="480p">480p</option>
-        <option value="768p">768p</option>
-      </select>
-      <select className="chip" value={params.seconds} onChange={(e) => setParams({ ...params, seconds: Number(e.target.value) })} title={t("Süre")}>
-        {VIDEO_SECONDS.map((s) => <option key={s} value={s}>{t("{n} sn", { n: s })}</option>)}
-      </select>
-      <button
-        className={`chip ${params.turbo ? "on" : ""}`}
-        onClick={() => setParams({ ...params, turbo: !params.turbo })}
-        title={t("Turbo: 8 adım, ~2.5 kat hızlı. Kapalı: 20 adım, daha ayrıntılı.")}
-      >
-        {params.turbo ? "Turbo" : t("Kaliteli")}
-      </button>
-    </>
-  );
-}
-
-export const SPEECH_LANGUAGES: Record<SpeechParams["engine"], [string, string][]> = {
-  chatterbox: [
-    ["Turkish", t("Türkçe")], ["English", t("İngilizce")], ["German", t("Almanca")], ["French", t("Fransızca")], ["Spanish", t("İspanyolca")],
-    ["Italian", t("İtalyanca")], ["Russian", t("Rusça")], ["Arabic", t("Arapça")], ["Portuguese", t("Portekizce")], ["Dutch", t("Felemenkçe")],
-    ["Polish", t("Lehçe")], ["Swedish", t("İsveççe")], ["Danish", t("Danca")], ["Norwegian", t("Norveççe")], ["Finnish", t("Fince")],
-    ["Greek", t("Yunanca")], ["Hebrew", t("İbranice")], ["Hindi", t("Hintçe")], ["Japanese", t("Japonca")], ["Korean", t("Korece")],
-    ["Chinese", t("Çince")], ["Malay", t("Malayca")], ["Swahili", t("Svahili")],
-  ],
-  qwen3: [
-    ["Auto", t("Otomatik")], ["English", t("İngilizce")], ["Chinese", t("Çince")], ["Japanese", t("Japonca")], ["Korean", t("Korece")],
-    ["German", t("Almanca")], ["French", t("Fransızca")], ["Russian", t("Rusça")], ["Portuguese", t("Portekizce")], ["Spanish", t("İspanyolca")],
-    ["Italian", t("İtalyanca")],
-  ],
-};
-export const QWEN3_PRESETS = ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"];
-
-export const DEFAULT_SPEECH_PARAMS: SpeechParams = {
-  engine: "chatterbox", language: "Turkish", voice_preset: "Vivian", instruct: "", reference_text: "",
-  exaggeration: 0.5, cfg_weight: 0.5, temperature: 0.8, seed: null,
-};
-
-export function SpeechChips({ params, setParams, cloning }: { params: SpeechParams; setParams: (p: SpeechParams) => void; cloning: boolean }) {
-  return (
-    <>
-      <select
-        className="chip"
-        value={params.engine}
-        title={t("Motor")}
-        onChange={(e) => {
-          const engine = e.target.value as SpeechParams["engine"];
-          setParams({ ...params, engine, language: SPEECH_LANGUAGES[engine][0][0], temperature: engine === "qwen3" ? 0.9 : 0.8 });
-        }}
-      >
-        <option value="chatterbox">{t("Chatterbox (23 dil)")}</option>
-        <option value="qwen3">Qwen3-TTS</option>
-      </select>
-      <select className="chip" value={params.language} onChange={(e) => setParams({ ...params, language: e.target.value })} title={t("Dil")}>
-        {SPEECH_LANGUAGES[params.engine].map(([k, label]) => <option key={k} value={k}>{label}</option>)}
-      </select>
-      {params.engine === "qwen3" && !cloning && (
-        <select className="chip" value={params.voice_preset} onChange={(e) => setParams({ ...params, voice_preset: e.target.value })} title={t("Hazır ses")}>
-          {QWEN3_PRESETS.map((v) => <option key={v} value={v}>{v}</option>)}
-        </select>
-      )}
-      {cloning && <span className="chip on" title={t("Eklenen ses dosyasının sesi kullanılır")}>{t("Ses klonlama")}</span>}
-    </>
-  );
-}
-
-export const TRANSCRIBE_LANGUAGES: [string, string][] = [
-  ["auto", t("Dili otomatik bul")], ["Turkish", t("Türkçe")], ["English", t("İngilizce")], ["German", t("Almanca")], ["French", t("Fransızca")],
-  ["Spanish", t("İspanyolca")], ["Italian", t("İtalyanca")], ["Russian", t("Rusça")], ["Arabic", t("Arapça")], ["Japanese", t("Japonca")],
-];
-
-export function TranscribeChips({ params, setParams }: { params: TranscribeParams; setParams: (p: TranscribeParams) => void }) {
-  return (
-    <select className="chip" value={params.language} onChange={(e) => setParams({ ...params, language: e.target.value })} title={t("Kaydın dili")}>
-      {TRANSCRIBE_LANGUAGES.map(([k, label]) => <option key={k} value={k}>{label}</option>)}
-    </select>
+    </label>
   );
 }

@@ -1,87 +1,82 @@
+/**
+ * MCP Resources: live GPU status, model catalog, and recent jobs.
+ */
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import * as api from "./api.js";
+import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { studioApi } from "./api.js";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 export function registerResources(server: McpServer): void {
-  server.resource(
-    "runtime_status",
-    "colab://runtime/status",
+  server.registerResource(
+    "studio-status",
+    "studio://status",
     {
-      description: "Live state, phase, credits balance, and active queue of the Colab L4 GPU runtime",
+      title: "Colab Studio Runtime Status",
+      description: "Live GPU state, VRAM/disk usage, model pack readiness, and stage timing estimates.",
       mimeType: "application/json",
     },
     async (uri) => {
-      const status = await api.getRuntimeStatus();
+      const state = await studioApi.getState();
       return {
         contents: [
           {
             uri: uri.href,
             mimeType: "application/json",
-            text: JSON.stringify(status, null, 2),
+            text: JSON.stringify(
+              {
+                runtime: state.runtime,
+                estimates: state.estimates,
+                startup_estimates: state.startup_estimates,
+                presets: state.presets,
+              },
+              null,
+              2
+            ),
           },
         ],
       };
     }
   );
 
-  server.resource(
-    "studio_settings",
-    "colab://settings",
+  server.registerResource(
+    "studio-recent-jobs",
+    "studio://jobs/recent",
     {
-      description: "Global configuration settings across all generation modes (image, video, speech, etc.)",
+      title: "Recent Jobs",
+      description: "The 25 most recent image, video, and faceswap jobs.",
       mimeType: "application/json",
     },
     async (uri) => {
-      const settings = await api.getSettings();
+      const state = await studioApi.getState();
       return {
         contents: [
           {
             uri: uri.href,
             mimeType: "application/json",
-            text: JSON.stringify(settings, null, 2),
+            text: JSON.stringify(state.jobs.slice(-25).reverse(), null, 2),
           },
         ],
       };
     }
   );
 
-  server.resource(
-    "system_status",
-    "colab://system/status",
+  server.registerResource(
+    "studio-models-catalog",
+    "studio://models/catalog",
     {
-      description: "Studio host health, service status, disk and memory utilization, and active Colab CLI sessions",
-      mimeType: "application/json",
+      title: "Model Catalog (models.default.toml)",
+      description: "HuggingFace repositories and filenames for image, image_turbo, video, and video_wan22 packs.",
+      mimeType: "application/toml",
     },
     async (uri) => {
-      const system = await api.getSystemStatus();
+      const tomlPath = resolve(REPO_ROOT, "station", "models.default.toml");
+      const text = await readFile(tomlPath, "utf8");
       return {
-        contents: [
-          {
-            uri: uri.href,
-            mimeType: "application/json",
-            text: JSON.stringify(system, null, 2),
-          },
-        ],
-      };
-    }
-  );
-
-  server.resource(
-    "recent_media",
-    "colab://media/recent",
-    {
-      description: "Inventory of the 20 most recently generated media files (with URLs and timestamps)",
-      mimeType: "application/json",
-    },
-    async (uri) => {
-      const media = await api.listMediaFiles(20);
-      return {
-        contents: [
-          {
-            uri: uri.href,
-            mimeType: "application/json",
-            text: JSON.stringify(media, null, 2),
-          },
-        ],
+        contents: [{ uri: uri.href, mimeType: "application/toml", text }],
       };
     }
   );

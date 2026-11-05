@@ -1,29 +1,17 @@
-import type { PackStatus } from "./api";
 import { t } from "./i18n";
 
-// Süre ve boyut metinleri sohbette, kenar çubuğunda ve ayarlarda aynı biçimde yazılır. Ortağı olan
-// bu yardımcılar ayrı modülde durur; Feed ile SystemPanel birbirini import etmez.
-
-const GB = 1024 ** 3;
-
-export function formatDuration(sec: number) {
-  if (sec < 60) return t("{n} sn", { n: sec });
-  const m = Math.floor(sec / 60);
-  if (m < 60) return t("{m} dk {s} sn", { m, s: sec % 60 });
+export function fmtDuration(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return t("{n} 秒", { n: s });
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return rem > 0 ? t("{m} 分 {s} 秒", { m, s: rem }) : t("{n} 分钟", { n: m });
   const h = Math.floor(m / 60);
-  return h < 48 ? t("{h} sa {m} dk", { h, m: m % 60 }) : t("{d} gün", { d: Math.floor(h / 24) });
+  const rm = m % 60;
+  return t("{h} 小时 {m} 分", { h, m: rm });
 }
 
-export const formatGB = (b: number) => `${(b / GB).toFixed(1)}`;
-
-/** "6.0/16.0 GB · 95 MB/s · ~2 dk" */
-export function downloadText(p: PackStatus) {
-  return [
-    `${formatGB(p.done)}/${formatGB(p.total)} GB`,
-    p.rate ? `${Math.round(p.rate / 2 ** 20)} MB/s` : null,
-    p.eta ? `~${formatDuration(p.eta)}` : null,
-  ].filter(Boolean).join(" · ");
+export function fmtHours(hours: number): string {
+  if (hours >= 48) return t("{d} 天", { d: (hours / 24).toFixed(1) });
+  return fmtDuration(hours * 3600);
 }
-
-/** Yüzde: Türkçede "%42", İngilizcede "42%". */
-export const pct = (value: number, round: (n: number) => number = Math.round) => t("%{n}", { n: round(value) });

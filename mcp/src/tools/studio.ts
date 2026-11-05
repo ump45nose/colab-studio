@@ -1,286 +1,193 @@
+/**
+ * GPU runtime, job queue, chat, preset, and file management MCP tools.
+ */
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import * as api from "../api.js";
+import { Mode, studioApi, waitForJob } from "../api.js";
+import { formatJobResult } from "./generation.js";
+
+const MODE_ENUM = z.enum(["image", "video", "faceswap"]);
+
+function jsonText(data: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+}
 
 export function registerStudioTools(server: McpServer): void {
-  server.tool(
-    "list_threads",
-    "List generation threads in Colab Studio. Omit 'mode' to list threads of every mode (backend returns all modes when no mode is given).",
+  server.registerTool(
+    "get_studio_status",
     {
-      mode: z.enum(["image", "video", "music", "speech", "transcribe", "model3d"]).optional().describe("Mode to filter threads by"),
+      title: "Get Studio & GPU Status",
+      description:
+        "Returns Colab GPU runtime state (off/starting/ready/stopping/error), VRAM/disk telemetry, model pack progress, and recent jobs.",
+      inputSchema: {
+        include_logs: z.boolean().default(false),
+        job_limit: z.number().int().min(0).max(50).default(10),
+      },
+    },
+    async ({ include_logs, job_limit }) => {
+      const state = await studioApi.getState();
+      const rt = { ...state.runtime };
+      if (!include_logs) delete (rt as Partial<typeof rt>).log;
+      return jsonText({
+        runtime: rt,
+        active_Or_queued_jobs: state.jobs.filter((j) => j.status === "queued" || j.status === "running"),
+        recent_jobs: state.jobs.slice(-job_limit).reverse(),
+        chat_count: state.chats.length,
+        presets: state.presets,
+      });
+    }
+  );
+
+  server.registerTool(
+    "start_gpu",
+    {
+      title: "Start Colab GPU",
+      description: "Starts the remote Colab GPU runtime (allocates GPU, sets up ComfyUI + FaceFusion, opens SSH tunnel).",
+      inputSchema: {
+        wait_until_ready: z.boolean().default(false),
+        timeout_sec: z.number().int().min(30).max(1800).default(600),
+      },
+    },
+    async ({ wait_until_ready, timeout_sec }) => {
+      let rt = await studioApi.startGpu();
+      if (wait_until_ready) {
+        const t0 = Date.now();
+        while (Date.now() - t0 < timeout_sec * 1000) {
+          if (rt.state === "ready" || rt.state === "error") break;
+          await new Promise((r) => setTimeout(r, 3000));
+          rt = (await studioApi.getState()).runtime;
+        }
+      }
+      return jsonText(rt);
+    }
+  );
+
+  server.registerTool(
+    "stop_gpu",
+    {
+      title: "Stop Colab GPU",
+      description: "Cancels active jobs and disconnects the Colab GPU runtime to stop compute unit burn.",
+      inputSchema: {},
+    },
+    async () => jsonText(await studioApi.stopGpu())
+  );
+
+  server.registerTool(
+    "get_compute_usage",
+    {
+      title: "Get Colab Compute Units (CU) Usage",
+      description: "Returns remaining Colab Compute Units, hourly burn rate, and 7-day usage history.",
+      inputSchema: {},
+    },
+    async () => jsonText(await studioApi.getUsage())
+  );
+
+  server.registerTool(
+    "get_job",
+    {
+      title: "Get Job Status",
+      description: "Fetches a job by ID and downloads outputs if completed.",
+      inputSchema: {
+        job_id: z.string().min(1),
+        download_outputs: z.boolean().default(true),
+        output_dir: z.string().optional(),
+      },
+    },
+    async ({ job_id, download_outputs, output_dir }) => {
+      const state = await studioApi.getState();
+      const job = state.jobs.find((j) => j.id === job_id);
+      if (!job) throw new Error(`Job not found: ${job_id}`);
+      if (download_outputs && job.status === "done") {
+        return formatJobResult(job, { outputDir: output_dir });
+      }
+      return jsonText(job);
+    }
+  );
+
+  server.registerTool(
+    "wait_for_job",
+    {
+      title: "Wait for Job Completion",
+      description: "Polls a queued/running job until completion and downloads its outputs.",
+      inputSchema: {
+        job_id: z.string().min(1),
+        timeout_sec: z.number().int().min(10).max(3600).default(1800),
+        output_dir: z.string().optional(),
+      },
+    },
+    async ({ job_id, timeout_sec, output_dir }) => {
+      const job = await waitForJob(job_id, { timeoutSec: timeout_sec });
+      return formatJobResult(job, { outputDir: output_dir });
+    }
+  );
+
+  server.registerTool(
+    "cancel_job",
+    {
+      title: "Cancel Job",
+      description: "Cancels a queued or running job.",
+      inputSchema: { job_id: z.string().min(1) },
+    },
+    async ({ job_id }) => jsonText(await studioApi.cancelJob(job_id))
+  );
+
+  server.registerTool(
+    "upload_media",
+    {
+      title: "Upload Image or Video",
+      description: "Uploads a local image (PNG, JPEG, WebP) or target video (MP4, WebM, MOV) to the server.",
+      inputSchema: { file_path: z.string().min(1) },
+    },
+    async ({ file_path }) => jsonText(await studioApi.uploadFile(file_path))
+  );
+
+  server.registerTool(
+    "list_chats",
+    {
+      title: "List Chats",
+      description: "Lists chat histories optionally filtered by mode (image, video, faceswap).",
+      inputSchema: { mode: MODE_ENUM.optional() },
     },
     async ({ mode }) => {
-      try {
-        const threads = await api.listThreads(mode);
-        return {
-          content: [
-            {
-              type: "text",
-              text: threads.length > 0
-                ? JSON.stringify(threads, null, 2)
-                : "No threads found.",
-            },
-          ],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to list threads: ${message}` }],
-        };
-      }
+      const state = await studioApi.getState();
+      const chats = mode ? state.chats.filter((c) => c.mode === mode) : state.chats;
+      return jsonText(chats);
     }
   );
 
-  server.tool(
-    "get_thread",
-    "Get full details and job history of a specific conversation thread.",
+  server.registerTool(
+    "delete_chat",
     {
-      thread_id: z.string().min(1).describe("The unique thread ID"),
+      title: "Delete Chat",
+      description: "Deletes a chat and cleans up its unreferenced media files.",
+      inputSchema: { chat_id: z.string().min(1) },
     },
-    async ({ thread_id }) => {
-      try {
-        const thread = await api.getThread(thread_id);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(thread, null, 2),
-            },
-          ],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to get thread: ${message}` }],
-        };
-      }
-    }
+    async ({ chat_id }) => jsonText(await studioApi.deleteChat(chat_id))
   );
 
-  server.tool(
-    "delete_thread",
-    "Delete a thread and its message records from Colab Studio.",
-    {
-      thread_id: z.string().min(1).describe("The thread ID to delete"),
-    },
-    async ({ thread_id }) => {
-      try {
-        const result = await api.deleteThread(thread_id);
-        return {
-          content: [
-            {
-              type: "text",
-              text: result.ok ? `Thread ${thread_id} deleted successfully.` : `Thread delete returned: ${JSON.stringify(result)}`,
-            },
-          ],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to delete thread: ${message}` }],
-        };
-      }
-    }
-  );
-
-  server.tool(
-    "list_presets",
-    "List saved parameter presets. Omit 'mode' to list presets of every mode (backend returns all modes when no mode is given).",
-    {
-      mode: z.enum(["image", "video", "music", "speech", "transcribe", "model3d"]).optional().describe("Mode to filter presets by"),
-    },
-    async ({ mode }) => {
-      try {
-        const presets = await api.listPresets(mode);
-        return {
-          content: [
-            {
-              type: "text",
-              text: presets.length > 0 ? JSON.stringify(presets, null, 2) : "No presets found.",
-            },
-          ],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to list presets: ${message}` }],
-        };
-      }
-    }
-  );
-
-  server.tool(
+  server.registerTool(
     "save_preset",
-    "Save a parameter configuration as a named preset.",
     {
-      mode: z.enum(["image", "video", "music", "speech", "transcribe", "model3d"]).describe("Generation mode"),
-      name: z.string().min(1).describe("Human-readable name for the preset"),
-      params: z.record(z.string(), z.unknown()).describe("Dictionary of parameters to save"),
+      title: "Save Parameter Preset",
+      description: "Saves a named parameter preset for image, video, or faceswap mode.",
+      inputSchema: {
+        mode: MODE_ENUM,
+        name: z.string().min(1).max(40),
+        params: z.record(z.unknown()),
+      },
     },
-    async ({ mode, name, params }) => {
-      try {
-        const result = await api.savePreset(mode, name, params);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Preset '${name}' saved successfully with ID: ${result.id}`,
-            },
-          ],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to save preset: ${message}` }],
-        };
-      }
-    }
+    async ({ mode, name, params }) =>
+      jsonText(await studioApi.savePreset(mode as Mode, name, params as Record<string, unknown>))
   );
 
-  server.tool(
+  server.registerTool(
     "delete_preset",
-    "Delete a saved preset by ID.",
     {
-      preset_id: z.string().min(1).describe("The preset ID"),
+      title: "Delete Parameter Preset",
+      description: "Deletes a saved preset.",
+      inputSchema: { mode: MODE_ENUM, name: z.string().min(1) },
     },
-    async ({ preset_id }) => {
-      try {
-        const result = await api.deletePreset(preset_id);
-        return {
-          content: [
-            {
-              type: "text",
-              text: result.ok ? `Preset ${preset_id} was deleted.` : `Delete preset returned: ${JSON.stringify(result)}`,
-            },
-          ],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to delete preset: ${message}` }],
-        };
-      }
-    }
-  );
-
-  server.tool(
-    "get_settings",
-    "Retrieve current global studio settings (default parameters across all modes).",
-    {},
-    async () => {
-      try {
-        const settings = await api.getSettings();
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(settings, null, 2),
-            },
-          ],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to get settings: ${message}` }],
-        };
-      }
-    }
-  );
-
-  server.tool(
-    "update_setting",
-    "Update a studio configuration setting key.",
-    {
-      key: z.enum([
-        "mode",
-        "image.params",
-        "video.params",
-        "music.params",
-        "speech.params",
-        "transcribe.params",
-        "model3d.params",
-      ]).describe("Setting key name"),
-      value: z.unknown().describe("Setting value (string or object)"),
-    },
-    async ({ key, value }) => {
-      try {
-        const result = await api.updateSetting(key, value);
-        return {
-          content: [
-            {
-              type: "text",
-              text: result.ok ? `Setting '${key}' updated successfully.` : `Update returned: ${JSON.stringify(result)}`,
-            },
-          ],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to update setting: ${message}` }],
-        };
-      }
-    }
-  );
-
-  server.tool(
-    "get_system_status",
-    "Check the studio host: colab-studio service, data disk usage, RAM, and Colab CLI sessions.",
-    {},
-    async () => {
-      try {
-        const health = await api.getSystemStatus();
-        const summary = [
-          `Colab Studio service: ${health.service.toUpperCase()}`,
-          `Host Uptime: ${health.uptime}`,
-          "",
-          "Disk Usage:",
-          health.diskUsage,
-          "",
-          "Memory Usage:",
-          health.memoryUsage,
-          "",
-          "Active Colab CLI Sessions:",
-          health.colabSessions,
-        ].join("\n");
-
-        return {
-          content: [{ type: "text", text: summary }],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to retrieve system status: ${message}` }],
-        };
-      }
-    }
-  );
-
-  server.tool(
-    "restart_colab_studio",
-    "Restart the colab-studio systemd user service (only when installed with install.sh --service).",
-    {},
-    async () => {
-      try {
-        const result = await api.restartService();
-        return {
-          content: [{ type: "text", text: result }],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Failed to restart service: ${message}` }],
-        };
-      }
-    }
+    async ({ mode, name }) => jsonText(await studioApi.deletePreset(mode as Mode, name))
   );
 }

@@ -1,64 +1,104 @@
-import { Box, FileText, Film, Image, Mic, Music, Plus, Trash2 } from "lucide-react";
-import type { Mode, RuntimeState, Thread } from "./api";
-import { SystemPanel } from "./SystemPanel";
-import { t } from "./i18n";
+import { Film, Image, Plus, Sparkles, Trash2, X } from "lucide-react";
+import { Chat, Mode } from "./api";
+import { t, useLang } from "./i18n";
 
-const MODES = [
-  { id: "image", label: t("Görsel"), icon: Image, ready: true },
-  { id: "video", label: t("Video"), icon: Film, ready: true },
-  { id: "model3d", label: t("3D model"), icon: Box, ready: true },
-  { id: "music", label: t("Müzik"), icon: Music, ready: true },
-  { id: "speech", label: t("Seslendirme"), icon: Mic, ready: true },
-  { id: "transcribe", label: t("Yazıya dök"), icon: FileText, ready: true },
+export const MODES: { id: Mode; label: string; icon: typeof Image }[] = [
+  { id: "image", label: "图片", icon: Image },
+  { id: "video", label: "视频", icon: Film },
+  { id: "faceswap", label: "换脸", icon: Sparkles },
 ];
 
 interface Props {
-  open: boolean;
-  rt: RuntimeState | null;
   mode: Mode;
   onMode: (m: Mode) => void;
-  threads: Thread[];
-  activeId: string | null;
-  onNew: () => void;
-  onSelect: (id: string) => void;
-  onDelete: (id: string) => void;
+  chats: Chat[];
+  activeChat: string | null;
+  onSelectChat: (c: Chat) => void;
+  onNewChat: () => void;
+  onDeleteChat: (id: string) => void;
+  open?: boolean;
+  onClose?: () => void;
 }
 
-export function Sidebar({ open, rt, mode, onMode, threads, activeId, onNew, onSelect, onDelete }: Props) {
+export default function Sidebar({
+  mode,
+  onMode,
+  chats,
+  activeChat,
+  onSelectChat,
+  onNewChat,
+  onDeleteChat,
+  open,
+  onClose,
+}: Props) {
+  useLang();
+  const modeChats = chats.filter((c) => c.mode === mode);
+  const pick = (fn: () => void) => () => {
+    fn();
+    onClose?.();
+  };
+
   return (
     <aside className={`sidebar ${open ? "open" : ""}`}>
-      <div className="brand">{t("Colab Stüdyo")}</div>
-      <nav className="modes">
-        {MODES.map((m) => (
-          <button key={m.id} className={`mode ${m.id === mode ? "active" : ""} ${m.ready ? "" : "soon"}`} disabled={!m.ready} onClick={() => onMode(m.id as Mode)}>
-            <m.icon size={16} /> {m.label} {!m.ready && <small>{t("yakında")}</small>}
+      <div className="brand">
+        <span className="brand-dot" />
+        <span className="brand-name">{t("Colab 工作台")}</span>
+        {onClose && (
+          <button className="icon-btn mobile-only" onClick={onClose} aria-label={t("关闭")}>
+            <X size={15} />
           </button>
-        ))}
-      </nav>
-      <div className="history-head">
-        <span>{t("Geçmiş")}</span>
-        <button className="icon-btn" onClick={onNew} aria-label={t("Yeni sohbet")} title={t("Yeni sohbet")}><Plus size={16} /></button>
+        )}
       </div>
-      <div className="history">
-        {threads.map((th) => (
-          <div key={th.id} className={`history-item ${th.id === activeId ? "active" : ""}`}>
-            <button className="history-open" onClick={() => onSelect(th.id)}>
-              <span title={th.title}>{th.title}</span>
-            </button>
+
+      <nav className="mode-list">
+        {MODES.map((m) => {
+          const Icon = m.icon;
+          const active = mode === m.id;
+          return (
             <button
-              className="icon-btn del"
-              aria-label={t("Sil")}
-              onClick={() => {
-                if (confirm(t("Bu sohbet ve sonuçları silinsin mi?"))) onDelete(th.id);
-              }}
+              key={m.id}
+              className={`mode-btn ${active ? "active" : ""}`}
+              onClick={pick(() => onMode(m.id))}
             >
-              <Trash2 size={14} />
+              <Icon size={16} />
+              <span>{t(m.label)}</span>
             </button>
-          </div>
-        ))}
-        {threads.length === 0 && <div className="muted" style={{ padding: "4px 10px", fontSize: 13 }}>{t("Henüz üretim yok.")}</div>}
+          );
+        })}
+      </nav>
+
+      <div className="chat-section">
+        <div className="chat-section-head">
+          <span>{t("历史记录")}</span>
+          <button className="icon-btn" onClick={pick(onNewChat)} title={t("新对话")} aria-label={t("新对话")}>
+            <Plus size={14} />
+          </button>
+        </div>
+        <div className="chat-list">
+          {modeChats.length === 0 && <div className="chat-empty">{t("暂无任务记录。")}</div>}
+          {modeChats.map((c) => (
+            <div
+              key={c.id}
+              className={`chat-item ${activeChat === c.id ? "active" : ""}`}
+              onClick={pick(() => onSelectChat(c))}
+            >
+              <span className="chat-title">{t(c.title)}</span>
+              <button
+                className="chat-del"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!window.confirm(t("确定删除该对话及其生成结果吗？"))) return;
+                  onDeleteChat(c.id);
+                }}
+                title={t("删除")}
+                aria-label={t("删除")}
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
       </div>
-      <SystemPanel rt={rt} />
     </aside>
   );
 }

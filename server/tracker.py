@@ -1,193 +1,185 @@
-"""Çalışan işin ilerlemesi ve kalan süresi.
+"""Credit & timing tracker: persists Colab CU balance and per-stage execution durations."""
+from __future__ import annotations
 
-ComfyUI yalnızca örnekleyicilerde adım bildirir; model yükleme, VAE, ağ işleme gibi düğümler
-sessiz geçer. Bu yüzden her düğümün süresi önceki işlerden öğrenilir (iş türü + süreyi etkileyen
-ayarlar = "variant"). Kalan süre = çalışan düğümün kalanı (adım bildiriyorsa ölçülen adım hızından)
-+ henüz çalışmamış düğümlerin öğrenilmiş süreleri + sıradaki grafikler (adet > 1).
-
-"Soğuk" iş, GPU açıldıktan sonra o türün ilk işidir: modeller diskten okunup GPU'ya yüklenir,
-sonrakilerden belirgin uzun sürer; süreleri ayrı öğrenilir.
-"""
-import re
+import json
+import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-SAMPLERS = ("KSampler", "SamplerCustomAdvanced")
+from . import config
 
+USAGE_FILE = config.DATA_DIR / "usage.json"
+TIMINGS_FILE = config.DATA_DIR / "timings.json"
+STARTUP_FILE = config.DATA_DIR / "startup_timings.json"
 
-def variant(job):
-    """Süreyi belirleyen ayarlar; aynı variant'lı işler aynı süre tablosunu paylaşır. Eski kayıtlarda
-    sonradan eklenen ayarlar olmayabilir (get)."""
-    p, kind = job["params"], job["kind"]
-    if kind == "image":
-        size = f"edit{p.get('edit_resolution')}x{len(job['inputs'])}" if job["inputs"] else p.get("size")
-        lora = "-turbo" if p.get("turbo") else ""
-        return f"{size}-s{p.get('steps')}-cfg{'1' if p.get('cfg') == 1 else 'n'}{lora}"
-    if kind == "video":
-        return f"{p.get('quality')}-{p.get('seconds')}s-{'turbo' if p.get('turbo') else 'full'}"
-    if kind == "model3d":
-        return f"{p.get('resolution')}-{p.get('texture')}"
-    if kind == "music":
-        return f"{p.get('seconds')}s"
-    if kind == "speech":
-        return f"{p.get('engine')}-{'clone' if job['inputs'] else 'preset'}"
-    if kind == "enhance":
-        return "edit" if job["inputs"] else "t2i"
-    return "-"
+MAX_SAMPLES = 25
+MAX_DAYS = 90
+OUTLIER_FACTOR = 4.0
 
+STARTUP_BASELINES: dict[str, float] = {
+    "boot": 180.0,
+    "pack:image": 85.0,
+    "pack:image_turbo": 95.0,
+    "pack:video": 180.0,
+    "pack:video_wan22": 150.0,
+}
 
-# variant() çıktısının kalıpları (iş türüne göre); süre tablosunda bunlara uymayan anahtarlar eskimiştir.
-_NUM = r"\d+(?:\.\d+)?"
-KNOWN_VARIANTS = {
-    "image": r"(?:1K|1\.5K|2K|edit(?:720p|1080p|1440p|2160p)x\d+)-s\d+-cfg[1n](?:-turbo)?",
-    "video": rf"(?:480p|768p)-{_NUM}s-(?:turbo|full)",
-    "model3d": r"(?:1024|1536|2048)-(?:pbr|vertex)",
-    "music": rf"{_NUM}s",
-    "speech": r"(?:chatterbox|qwen3)-(?:clone|preset)",
-    "enhance": r"(?:edit|t2i)",
-    "transcribe": r"-",
+BASELINES: dict[str, tuple[float, float]] = {
+    "image:正在加载模型": (28.0, 2.0),
+    "image:正在读取参考图": (3.0, 2.0),
+    "image:正在编码提示词": (6.0, 4.0),
+    "image:正在准备画布": (1.0, 1.0),
+    "image:正在生成": (55.0, 55.0),
+    "image:正在保存": (3.0, 3.0),
+    "video:正在加载模型": (50.0, 3.0),
+    "video:正在读取参考图": (2.0, 2.0),
+    "video:正在编码提示词": (15.0, 10.0),
+    "video:正在准备画布": (2.0, 2.0),
+    "video:正在生成": (180.0, 180.0),
+    "video:正在生成（高噪阶段）": (110.0, 110.0),
+    "video:正在生成（低噪阶段）": (110.0, 110.0),
+    "video:正在解码音频": (4.0, 4.0),
+    "video:正在保存": (12.0, 12.0),
+    "faceswap:正在释放显存与上传素材": (4.0, 2.0),
+    "faceswap:正在执行换脸流水线": (45.0, 35.0),
+    "faceswap:正在回传换脸结果": (4.0, 3.0),
 }
 
 
-def is_known_timing_key(key):
-    """Süre anahtarı "{tür}|{variant}|..." bugünkü variant kalıplarına uyuyor mu?"""
-    parts = key.split("|")
-    pattern = KNOWN_VARIANTS.get(parts[0])
-    return len(parts) >= 3 and pattern is not None and re.fullmatch(pattern, parts[1]) is not None
+def _read_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
 
 
-class Tracker:
-    def __init__(self, timings, job, graphs, cold):
-        self.timings = timings  # öğrenilmiş süreler: anahtar -> sn (yalnızca okunur)
-        self.prefix = f"{job['kind']}|{variant(job)}"
-        self.known = any(k.startswith(self.prefix + "|") for k in timings)
-        self.graphs = graphs
-        self.cold = cold
-        self.measured = {}  # bu işte ölçülen düğüm süreleri
-        self.graph_times = []  # biten grafiklerin süreleri
-        self.started = time.time()
-        self.gi = 0
-        self.graph_started = self.started
-        self.done = set()  # (grafik, düğüm): çalışmış ya da önbellekten gelmiş
-        self.node = None
-        self.node_started = None
-        self.steps = None  # {"v", "mx", "t0", "v0", "rate"}
-        self.last = 0.0
+def _write_json(path: Path, data) -> None:
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
 
-    # --- ComfyUI olayları ---
 
-    def start_graph(self, gi):
-        self._finish_node()
-        if gi > self.gi:
-            self.graph_times.append(time.time() - self.graph_started)
-        self.gi, self.graph_started = gi, time.time()
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    def cached(self, nodes):
-        self.done.update((self.gi, n) for n in nodes)
 
-    def executing(self, node):
-        self._finish_node()
-        if node is not None:
-            self.node, self.node_started, self.steps = node, time.time(), None
+def record_usage(raw: dict, gpu_tier: str, runtime_active: bool) -> dict:
+    """Update usage history from raw `colab usage --json` and return enriched summary."""
+    now = time.time()
+    balance = float(raw.get("balance") or 0.0)
+    rates = dict(raw.get("burn_rates_hourly") or {})
+    if "a100" in rates and "g2-standard-12" not in rates:
+        rates["g2-standard-12"] = round(float(rates["a100"]) * 0.4, 2)
+    burn_rate = float(rates.get(gpu_tier) or rates.get("l4") or 1.8)
 
-    def progress(self, v, mx):
-        now = time.time()
-        s = self.steps
-        if s is None or v < s["v"] or mx != s["mx"]:
-            self.steps = {"v": v, "mx": mx, "t0": now, "v0": v, "rate": None}
-            return
-        if v > s["v0"]:
-            s["rate"] = (now - s["t0"]) / (v - s["v0"])
-        s["v"] = v
+    hist = _read_json(USAGE_FILE, {})
+    last_bal = hist.get("last_balance")
+    delta = (last_bal - balance) if isinstance(last_bal, (int, float)) and last_bal > balance else 0.0
 
-    def finish(self):
-        self._finish_node()
-        self.graph_times.append(time.time() - self.graph_started)
-
-    def _finish_node(self):
-        if self.node is None:
-            return
-        self.measured[self._key(self.gi, self.node)] = time.time() - self.node_started
-        self.done.add((self.gi, self.node))
-        self.node = None
-
-    # --- tahmin ---
-
-    def _key(self, gi, node):
-        return f"{self.prefix}|{'cold' if self.cold and gi == 0 else 'warm'}|{node}"
-
-    def expected(self, gi, node):
-        """Düğümün öğrenilmiş süresi; sıcak ölçüm yoksa soğuk ölçüm kullanılır (önbellekten gelen
-        yükleyiciler zaten sayılmaz)."""
-        key = self._key(gi, node)
-        if key in self.timings:
-            return self.timings[key]
-        return self.timings.get(key.replace("|warm|", "|cold|"))
-
-    def _graph_expected(self, gi):
-        """Henüz başlamamış bir grafiğin süresi: bu işte biten son sıcak grafik (modeller artık
-        yüklü), yoksa öğrenilmiş sıcak grafik süresi."""
-        last_warm = self.graph_times and not (self.cold and len(self.graph_times) == 1)
-        if last_warm:  # soğuk ilk grafik (model yükleme dahil) örnek alınmaz
-            return self.graph_times[-1]
-        warm = self.timings.get(f"{self.prefix}|graph|warm")
-        return warm if warm is not None else self.timings.get(f"{self.prefix}|graph|cold")
-
-    def current_remaining(self):
-        if self.node is None:
-            return 0.0
-        s = self.steps
-        if s and s["rate"]:
-            return (s["mx"] - s["v"]) * s["rate"]
-        e = self.expected(self.gi, self.node)
-        return max(e - (time.time() - self.node_started), 0.0) if e is not None else 0.0
-
-    def remaining(self):
-        """Kalan süre (sn); bu iş türü/ayarı daha önce hiç çalışmadıysa None."""
-        if not self.known:
-            return None
-        rest = sum(self.expected(self.gi, n) or 0.0 for n in self.graphs[self.gi]
-                   if (self.gi, n) not in self.done and n != self.node)
-        later = 0.0
-        for gi in range(self.gi + 1, len(self.graphs)):
-            g = self._graph_expected(gi)
-            if g is None:
-                return None
-            later += g
-        return self.current_remaining() + rest + later
-
-    def _sampler_fraction(self):
-        """Süre bilinmezken ilerleme: biten örnekleyiciler ve çalışanın adımları."""
-        graph = self.graphs[self.gi]
-        samplers = [n for n in graph if graph[n]["class_type"] in SAMPLERS] or [None]
-        done = sum(1 for n in samplers if (self.gi, n) in self.done)
-        cur = self.steps["v"] / self.steps["mx"] if self.steps and self.node in samplers else 0.0
-        return (self.gi + min((done + cur) / len(samplers), 1.0)) / len(self.graphs)
-
-    def snapshot(self):
-        """Arayüze giden durum: ilerleme (geri gitmez), kalan süre, çalışan düğümün süresi."""
-        now = time.time()
-        eta = self.remaining()
-        if eta is None:
-            p = self._sampler_fraction()
+    sess = hist.get("session")
+    if runtime_active:
+        if not sess or not sess.get("active"):
+            sess = {"active": True, "started_at": now, "start_balance": balance, "used": 0.0}
         else:
-            elapsed = now - self.started
-            p = elapsed / (elapsed + eta) if elapsed + eta > 0 else 0.0
-        self.last = max(self.last, min(p, 0.99))
-        node = self.graphs[self.gi].get(self.node) if self.node else None
-        expected = self.expected(self.gi, self.node) if self.node else None
-        return {
-            "progress": self.last,
-            "eta": round(eta) if eta is not None else None,
-            "stage_seconds": round(now - self.node_started) if self.node else None,
-            "stage_expected": round(expected) if expected is not None else None,
-            # Örnekleyici ilk adımını bitirene kadar model diskten okunup GPU'ya yükleniyordur.
-            "loading": bool(node and node["class_type"] in SAMPLERS and self.steps is None),
-        }
+            sess["used"] = round(max(0.0, float(sess.get("start_balance", balance)) - balance), 2)
+    else:
+        if sess and sess.get("active"):
+            sess["active"] = False
 
-    def learned(self):
-        """İş başarıyla bitince saklanacak ölçümler (düğümler ve grafik süreleri)."""
-        out = dict(self.measured)
-        for gi, t in enumerate(self.graph_times):
-            out[f"{self.prefix}|graph|{'cold' if self.cold and gi == 0 else 'warm'}"] = t
-        out[f"{self.prefix}|total"] = time.time() - self.started
-        return out
+    day = _today()
+    days: dict[str, float] = hist.get("days") or {}
+    days.setdefault(day, 0.0)
+    if 0 < delta < 50:
+        days[day] = round(days[day] + delta, 3)
+    if len(days) > MAX_DAYS:
+        for k in sorted(days)[:-MAX_DAYS]:
+            del days[k]
+
+    hist = {"last_balance": balance, "last_ts": now, "session": sess, "days": days}
+    _write_json(USAGE_FILE, hist)
+
+    recent = [v for k, v in sorted(days.items())[-7:] if v > 0]
+    daily_avg = round(sum(recent) / len(recent), 2) if recent else None
+    return {
+        **raw,
+        "burn_rates_hourly": rates,
+        "gpu_tier": gpu_tier,
+        "current_burn_rate": round(burn_rate, 2),
+        "remaining_hours_active": round(balance / burn_rate, 1) if burn_rate > 0 else None,
+        "session_used": round(sess["used"], 2) if sess else 0.0,
+        "today_used": round(days.get(day, 0.0), 2),
+        "daily_avg_7d": daily_avg,
+        "days_Observed": len(recent),
+        "projected_days_left": round(balance / daily_avg, 1) if daily_avg and daily_avg > 0.05 else None,
+        "daily_history": [{"date": k, "used": round(v, 2)} for k, v in sorted(days.items())[-14:]],
+    }
+
+
+def _median(xs: list[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def record_stage(kind: str, stage: str, warm: bool, duration_s: float) -> None:
+    if duration_s < 0.2 or duration_s > 3600:
+        return
+    key = f"{kind}:{stage}"
+    bucket = "warm" if warm else "cold"
+    data: dict = _read_json(TIMINGS_FILE, {})
+    entry = data.setdefault(key, {"cold": [], "warm": []})
+    samples: list[float] = entry.setdefault(bucket, [])
+    if len(samples) >= 3:
+        med = _median(samples)
+        if med > 1.0 and duration_s > med * OUTLIER_FACTOR:
+            return
+    samples.append(round(duration_s, 2))
+    del samples[:-MAX_SAMPLES]
+    _write_json(TIMINGS_FILE, data)
+
+
+def get_estimates() -> dict:
+    data: dict = _read_json(TIMINGS_FILE, {})
+    keys = set(BASELINES) | set(data)
+    out: dict[str, dict] = {}
+    for k in keys:
+        base_c, base_w = BASELINES.get(k, (15.0, 10.0))
+        rec = data.get(k) or {}
+        cold_s = rec.get("cold") or []
+        warm_s = rec.get("warm") or []
+        out[k] = {
+            "cold": round(_median(cold_s), 1) if cold_s else base_c,
+            "warm": round(_median(warm_s), 1) if warm_s else base_w,
+            "samples": len(cold_s) + len(warm_s),
+        }
+    return out
+
+
+def record_startup(key: str, duration_s: float) -> None:
+    if duration_s < 1.0 or duration_s > 3600:
+        return
+    data: dict = _read_json(STARTUP_FILE, {})
+    samples: list[float] = data.setdefault(key, [])
+    if len(samples) >= 3:
+        med = _median(samples)
+        if med > 5.0 and duration_s > med * OUTLIER_FACTOR:
+            return
+    samples.append(round(duration_s, 1))
+    del samples[:-MAX_SAMPLES]
+    _write_json(STARTUP_FILE, data)
+
+
+def get_startup_estimates() -> dict:
+    data: dict = _read_json(STARTUP_FILE, {})
+    out: dict[str, dict] = {}
+    for k in set(STARTUP_BASELINES) | set(data):
+        s = data.get(k) or []
+        out[k] = {
+            "expected": round(_median(s), 1) if s else STARTUP_BASELINES.get(k, 120.0),
+            "samples": len(s),
+        }
+    return out

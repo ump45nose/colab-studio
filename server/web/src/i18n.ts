@@ -1,68 +1,112 @@
+import { useSyncExternalStore } from "react";
 import { EN, SERVER_PATTERNS } from "./en";
 
-// Arayüz metinleri kaynakta Türkçe yazılır ve t() ile seçili dile çevrilir; İngilizce karşılıklar
-// en.ts'de. Sunucunun gönderdiği (Türkçe) durum ve hata metinleri tServer() ile çevrilir: önce birebir
-// eşleşme, sonra yer tutuculu kalıplar. Tanınmayan metin (ör. ComfyUI'nin ham hatası) olduğu gibi kalır.
+export type Lang = "zh" | "en";
+export const LANGS: Lang[] = ["zh", "en"];
 
-export type Lang = "en" | "tr";
-export const LANGS: [Lang, string][] = [["en", "English"], ["tr", "Türkçe"]];
-const KEY = "studio.lang";
+const STORAGE_KEY = "studio.lang";
 
-function initial(): Lang {
+function detectLang(): Lang {
   try {
-    const v = localStorage.getItem(KEY);
-    if (v === "en" || v === "tr") return v;
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved === "zh" || saved === "en") return saved;
   } catch {
-    // localStorage kapalıysa varsayılan dil
+    /* ignore */
   }
-  return "en";
+  return "zh";
 }
 
-export const lang: Lang = initial();
-document.documentElement.lang = lang;
+let currentLang: Lang = detectLang();
+const listeners = new Set<() => void>();
 
-type Vars = Record<string, string | number>;
-
-const fill = (s: string, vars?: Vars) =>
-  vars ? s.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? String(vars[k]) : m)) : s;
-
-/** Türkçe kaynak metni seçili dile çevirir; {ad} yer tutucuları vars ile doldurulur. */
-export function t(tr: string, vars?: Vars): string {
-  return fill(lang === "en" ? (EN[tr] ?? tr) : tr, vars);
+export function getLang(): Lang {
+  return currentLang;
 }
 
-const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-// "GPU açılamadı: {detail}" -> /^GPU açılamadı: ([\s\S]*)$/ ; yakalananlar da çevrilir (iç içe mesajlar).
-const COMPILED = SERVER_PATTERNS.map(([tr, en]) => {
-  const names: string[] = [];
-  const source = tr.split(/(\{\w+\})/).map((part) => {
-    const m = part.match(/^\{(\w+)\}$/);
-    if (!m) return escape(part);
-    names.push(m[1]);
-    return "([\\s\\S]*?)";
-  }).join("");
-  return { re: new RegExp(`^${source}$`), names, en };
-});
-
-/** Sunucudan gelen Türkçe metni seçili dile çevirir. */
-export function tServer(msg: string | null | undefined): string {
-  if (!msg) return "";
-  if (lang === "tr") return msg;
-  const exact = EN[msg];
-  if (exact !== undefined) return exact;
-  for (const { re, names, en } of COMPILED) {
-    const m = msg.match(re);
-    if (m) return fill(en, Object.fromEntries(names.map((n, i) => [n, tServer(m[i + 1])])));
-  }
-  return msg;
-}
-
-export function setLang(l: Lang) {
+export function setLang(lang: Lang): void {
+  if (lang === currentLang) return;
+  currentLang = lang;
   try {
-    localStorage.setItem(KEY, l);
+    localStorage.setItem(STORAGE_KEY, lang);
   } catch {
-    // kaydedilemese de bu oturumda geçerli olsun
+    /* ignore */
   }
-  location.reload();
+  if (typeof document !== "undefined") {
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+  }
+  listeners.forEach((fn) => fn());
+}
+
+export function useLang(): [Lang, (l: Lang) => void] {
+  const lang = useSyncExternalStore<Lang>(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => currentLang,
+    () => "zh"
+  );
+  return [lang, setLang];
+}
+
+function interpolate(tpl: string, vars?: Record<string, string | number>): string {
+  if (!vars) return tpl;
+  return tpl.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+}
+
+export function t(key: string, vars?: Record<string, string | number>): string {
+  if (currentLang === "zh") return interpolate(key, vars);
+  const exact = EN[key];
+  if (exact) return interpolate(exact, vars);
+  return interpolate(translateServerText(key), vars);
+}
+
+interface CompiledPattern {
+  re: RegExp;
+  names: string[];
+  target: string;
+}
+
+let compiled: CompiledPattern[] | null = null;
+
+function getCompiled(): CompiledPattern[] {
+  if (compiled) return compiled;
+  compiled = SERVER_PATTERNS.map(([src, dst]) => {
+    const names: string[] = [];
+    const parts = src.split(/(\{\w+\})/g);
+    const rx = parts
+      .map((p) => {
+        const m = /^\{(\w+)\}$/.exec(p);
+        if (m) {
+          names.push(m[1]);
+          return "([\\s\\S]+?)";
+        }
+        return p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      })
+      .join("");
+    return { re: new RegExp(`^${rx}$`), names, target: dst };
+  });
+  return compiled;
+}
+
+export function translateServerText(raw: string): string {
+  if (!raw || currentLang === "zh") return raw;
+  if (EN[raw]) return EN[raw];
+
+  const prefixMatch = /^(\[\d+\/\d+\]\s+)([\s\S]+)$/.exec(raw);
+  if (prefixMatch) {
+    return prefixMatch[1] + translateServerText(prefixMatch[2]);
+  }
+
+  for (const pat of getCompiled()) {
+    const m = pat.re.exec(raw);
+    if (m) {
+      const vars: Record<string, string> = {};
+      pat.names.forEach((name, idx) => {
+        vars[name] = translateServerText(m[idx + 1]);
+      });
+      return interpolate(pat.target, vars);
+    }
+  }
+  return raw;
 }

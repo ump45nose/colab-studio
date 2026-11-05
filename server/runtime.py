@@ -1,734 +1,550 @@
-"""Colab GPU runtime'ının yaşam döngüsü.
+"""Colab GPU lifecycle manager: allocate -> SSH -> setup -> ComfyUI + FaceFusion -> tunnel -> watchdog -> stop."""
+from __future__ import annotations
 
-Runtime'ı açar ve kapatır, modelleri HuggingFace'ten indirtip ComfyUI'yi kurar ve bu sunucuya
-yönlendirir (127.0.0.1:8188), boşta kalınca runtime'ı kapatır, kredi ve sistem kullanımını izler.
-"""
 import asyncio
 import json
-import os
-import re
+import shlex
 import shutil
+import subprocess
 import time
-from collections import deque
+import urllib.request
 from pathlib import Path
 
-from aiohttp import ClientConnectorError, ClientSession, ClientTimeout
+from . import config, tracker
 
-import config
-
-COLAB = config.COLAB
-COLAB_SESSIONS = config.COLAB_SESSIONS
-SESSION = config.SESSION
-GPU = config.GPU
-IDLE_MINUTES = config.IDLE_MINUTES
-COMFY_PORT = 8188
+STATION_DIR = Path(__file__).resolve().parent.parent / "station"
+MODELS_TOML = Path(__file__).resolve().parent.parent / "models.toml"
+COMFY_PORT = 18188
 COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
-REPO_DIR = config.REPO_DIR
-DATA_DIR = config.DATA_DIR
-DURATIONS_FILE = DATA_DIR / "startup_durations.json"
-OWNED_FILE = DATA_DIR / "owned_endpoints.json"  # stüdyonun açtığı GPU runtime'ları
-SSH_DIR = DATA_DIR / "ssh"
-SSH_CONF = SSH_DIR / "config"
-SSH_KEY = SSH_DIR / "id_ed25519"
-SSH = ["ssh", "-F", str(SSH_CONF)]
-POLL_SECONDS = 30
-METRICS_SECONDS = 5
-METRICS_HISTORY = 120  # 10 dakika
-MODEL_POLL_SECONDS = 3
-# Model beklerken bu süre boyunca hiçbir paketin inen baytı artmazsa indirici takılmış sayılır.
-MODEL_STALL_SECONDS = 600
+IDLE_TIMEOUT = config.IDLE_TIMEOUT_MIN * 60
+HEALTH_FAIL_LIMIT = 3
+SETUP_STALL_TIMEOUT = 15 * 60
 
-
-def ssh_conf_text():
-    return f"""Host colab
-  ProxyCommand sh {Path(__file__).parent / "colab_proxy.sh"} {SESSION} {COLAB_SESSIONS} {COLAB} {SSH_KEY}
-  User root
-  IdentityFile {SSH_KEY}
-  IdentitiesOnly yes
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-  LogLevel ERROR
-  ControlMaster auto
-  ControlPath {SSH_DIR}/cm
-  ControlPersist yes
-  ServerAliveInterval 15
-  ServerAliveCountMax 4
-  ConnectTimeout 30
-"""
-
-
-COLAB_TOKEN = Path("~/.config/colab-cli/token.json").expanduser()
-
-
-def preflight():
-    """Kurulum eksikse kullanıcıya gösterilecek hata; tamamsa None. Eksik kurulumda colab/ssh
-    çağrıları anlaşılmaz "komut bulunamadı" hatalarıyla düşmesin."""
-    if not os.access(COLAB, os.X_OK):
-        return f"colab CLI bulunamadı ({COLAB}): ./install.sh çalıştır ya da .env'de COLAB_BIN ayarla"
-    if not COLAB_TOKEN.exists():
-        if os.environ.get("STUDIO_IN_DOCKER"):
-            return "colab CLI'da Google girişi yok: 'docker compose run --rm studio colab usage' ile giriş yap, sonra GPU'yu tekrar başlat"
-        return "colab CLI'da Google girişi yok: terminalde 'colab usage' çalıştırıp giriş yap, sonra GPU'yu tekrar başlat"
-    for tool in ("ssh", "ssh-keygen", "tar"):
-        if shutil.which(tool) is None:
-            return f"{tool} bulunamadı: openssh-client ve tar kurulu olmalı"
-    return None
-
-
-async def ensure_ssh_key():
-    """Stüdyoya ait SSH anahtarı (kullanıcının ~/.ssh'ına dokunulmaz); yoksa üretilir."""
-    SSH_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not SSH_KEY.exists():
-        await run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "colab-studio", "-f", str(SSH_KEY), timeout=30)
-
-
-# Açılış adımları: (kimlik, ekranda görünen ad, ilk tahmini süre sn). Tahminler ölçülen
-# sürelerle güncellenir.
-STEPS = [
-    ("allocate", "GPU ayrılıyor", 60),
-    ("connect", "Bağlanılıyor", 15),
-    ("install", "Modeller indiriliyor, ComfyUI kuruluyor", 90),
-    ("comfy", "ComfyUI başlatılıyor", 40),
-]
-
-state = {
-    "phase": "off",  # off | starting | ready | stopping | error
-    "detail": "",
-    "auto_shutdown": True,
-    "last_busy": None,
-    "start_balance": None,
-    "ready_at": None,
-    "credits": None,
-    "startup": None,  # {"step": i, "started_at": t, "step_started_at": t}
+PACK_LABELS = {
+    "image": "图片 (Krea2-Noct)",
+    "image_turbo": "极速图片 (Z-Image-Turbo)",
+    "video": "视频 (MiniMax-H3)",
+    "video_wan22": "视频 (Wan2.2-Remix)",
 }
-logs = deque(maxlen=300)
-metrics = deque(maxlen=METRICS_HISTORY)
-ready = asyncio.Event()
-_start_task = None
-# Model paketi inmiş iş türleri (station/models.py). Görsel paketi açılışta beklenir,
-# diğerleri arka planda iner; iş gelince paketi inene kadar beklenir.
-local_modes = set()
-# Bu oturumda en az bir işi bitmiş türler: modelleri bir kez diskten okunup yüklenmiştir.
-warm = set()
-warming = False
-_has_pending = lambda: False
-# İnen model paketlerinin ilerlemesi (station/models.py'nin progress.json'u): paket -> {total, done}
-packs = {}
-# (zaman, toplam inen bayt): ilk ve son ölçüm. Hız indirmenin başından beri ortalama: xet dosyayı
-# hızla çekip sonunda diske yazarken dakikalarca duraksıyor; anlık hız sıfıra düşüp kalan süreyi
-# saatlere çıkarmasın.
-_pack_samples = []
-setup_phase = {"text": None}  # kurulum betiğinin aşaması ("3/5 ..."), açılışta okunur
-PACK_LABELS = {"image": "Görsel", "speech": "Ses", "enhance": "İstem geliştirme", "model3d": "3D", "video": "Video", "music": "Müzik"}
-# station/models.py'deki paketler; yazıya dökme (Whisper) ve Chatterbox modellerini eklentileri ilk
-# kullanımda kendisi indirir (küçükler).
-PACKS = {"image", "speech", "enhance", "model3d", "video", "music"}
 
 
-def log(msg):
-    logs.append(f"{time.strftime('%H:%M:%S')} {msg}")
-
-
-def short_error(e, limit=700):
-    """Hata metnini kısaltır: komut çıktısında asıl hata en sondadır, ilk satır ise neyin
-    başarısız olduğunu söyler; ikisi de kalır."""
-    text = str(e) or type(e).__name__
-    if len(text) <= limit:
-        return text
-    head = text.split("\n", 1)[0][:150]
-    return f"{head}\n…\n{text[-(limit - len(head) - 3):]}"
-
-
-def set_phase(phase, detail=""):
-    state["phase"] = phase
-    state["detail"] = detail
-    if phase == "ready":
-        ready.set()
-    else:
-        ready.clear()
-    if phase != "starting":
-        state["startup"] = None
-    log(f"[{phase}] {detail}")
-
-
-def expected_durations():
-    """Öğrenilmiş açılış adımı süreleri. Dosya bozuksa (yarım yazma, elle düzenleme, disk hatası)
-    varsayılanlara düşülür: bozuk dosya arayüzün tamamını 500'e düşürmemeli (_learn atomik yazar)."""
-    learned = {}
-    try:
-        data = json.loads(DURATIONS_FILE.read_text())
-        if isinstance(data, dict):
-            learned = {k: v for k, v in data.items() if isinstance(v, (int, float))}
-    except (OSError, ValueError) as e:
-        log(f"açılış süreleri okunamadı, varsayılanlar kullanılıyor: {short_error(e, 200)}")
-    return {key: learned.get(key, default) for key, _, default in STEPS}
-
-
-def _learn(i):
-    """Adımın ölçülen süresini öğrenir (yeni ölçüm %50 ağırlıklı). Dosya atomik yazılır: yazma
-    sırasında bir çökme yarım JSON bırakmasın."""
-    key = STEPS[i][0]
-    learned = expected_durations()
-    learned[key] = round(0.5 * learned[key] + 0.5 * (time.time() - state["startup"]["step_started_at"]), 1)
-    tmp = DURATIONS_FILE.with_suffix(".json.tmp")
-    try:
-        tmp.write_text(json.dumps(learned))
-        os.replace(tmp, DURATIONS_FILE)
-    except OSError as e:
-        log(f"açılış süresi kaydedilemedi: {short_error(e, 200)}")
-
-
-def _begin_step(i):
-    if i > 0:
-        _learn(i - 1)
-    state["startup"]["step"] = i
-    state["startup"]["step_started_at"] = time.time()
-    state["detail"] = STEPS[i][1]
-    log(f"[starting] {STEPS[i][1]}")
-
-
-async def run(*cmd, timeout, shell=False, quiet=False, stdin_data=None):
-    if shell:
-        proc = await asyncio.create_subprocess_shell(
-            cmd[0], stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+def _check_host_tools() -> None:
+    if not Path(config.COLAB_BIN).exists():
+        raise RuntimeError(
+            f"未找到 colab CLI ({config.COLAB_BIN})：请运行 ./install.sh 或在 .env 中设置 COLAB_BIN"
         )
-    else:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-        )
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(stdin_data), timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise RuntimeError(f"zaman aşımı ({timeout}s): {' '.join(cmd)[:120]}") from None
-    except asyncio.CancelledError:
-        # Açılış iptal edildiyse "colab new" gibi süreçler arkada sürüp runtime açmasın.
-        proc.kill()
-        raise
-    text = out.decode(errors="replace")
-    if not quiet:
-        for line in text.splitlines()[-20:]:
-            log(line)
-    if proc.returncode != 0:
-        raise RuntimeError(f"komut başarısız ({proc.returncode}): {' '.join(cmd)[:120]}\n{text[-800:]}") from None
-    return text
+    for tool in ("ssh", "tar"):
+        if not shutil.which(tool):
+            raise RuntimeError(f"未找到 {tool}：需安装 openssh-client 和 tar")
 
 
-async def _start():
-    problem = preflight()
-    if problem:
-        set_phase("error", problem)
-        return
-    try:
-        _begin_step(0)
-        await run(COLAB, "new", "--gpu", GPU, "-s", SESSION, timeout=600)
-        _own(json.loads(COLAB_SESSIONS.read_text())[SESSION]["endpoint"])
-        state["start_balance"] = parse_usage(await run(COLAB, "usage", timeout=60))["balance"]
-
-        _begin_step(1)
-        await ensure_ssh_key()
-        SSH_CONF.write_text(ssh_conf_text())
-        await connect()
-
-        _begin_step(2)
-        if config.HF_TOKEN:
-            await run(*SSH, "colab", "install -D -m 600 /dev/stdin /root/.cache/huggingface/token",
-                      timeout=30, stdin_data=config.HF_TOKEN.encode())
-        else:
-            log("HF_TOKEN yok: modeller girişsiz iner (Hugging Face hız sınırına takılabilir)")
-        await run(f"tar -C '{REPO_DIR}' -cz --exclude=__pycache__ station | ssh -F '{SSH_CONF}' colab 'tar -C /content -xz'", timeout=120, shell=True)
-        # Model kataloğu (models.toml): station/models.py ve iş akışları aynı dosyayı kullanır.
-        await run(*SSH, "colab", "install -D -m 644 /dev/stdin /content/station/models.toml",
-                  timeout=30, stdin_data=config.MODELS_FILE.read_bytes())
-        poller = asyncio.create_task(poll_packs())
-        try:
-            await run(*SSH, "colab", f"bash /content/station/runtime_setup.sh {state['startup']['pack'] or 'none'}", timeout=1800)
-        finally:
-            poller.cancel()
-
-        _begin_step(3)
-        await forward_comfy()
-        await wait_comfy_ready()
-        _learn(len(STEPS) - 1)
-        if state["startup"]["pack"]:
-            local_modes.add(state["startup"]["pack"])
-        state["last_busy"] = time.time()
-        state["ready_at"] = time.time()
-        set_phase("ready", "GPU hazır")
-        asyncio.create_task(warmup())
-    except Exception as e:
-        # Önce kapat, sonra hata göster: hata durumunda yeni bir açılış başlayabilir ve kapanış
-        # onun oturumunu öldürmemeli.
-        set_phase("stopping", "açılış başarısız, kapatılıyor")
-        try:
-            await stop_runtime()
-        except RuntimeError as stop_error:
-            log(short_error(stop_error))  # bırakılamayan runtime'ı watchdog yeniden dener
-        set_phase("error", short_error(e))
+def _clean_err(raw: str) -> str:
+    lines = [
+        ln.strip() for ln in raw.splitlines()
+        if ln.strip() and not ln.startswith(("WARNING:", "Warning: Permanently added"))
+    ]
+    msg = lines[-1] if lines else raw.strip()
+    if "not authenticated" in msg.lower() or "colab auth login" in msg.lower():
+        if Path("/.dockerenv").exists():
+            return "colab CLI 未登录 Google：请执行 'docker compose run --rm studio colab usage' 完成登录，然后重新启动 GPU"
+        return "colab CLI 未登录 Google：请在终端执行 'colab usage' 完成登录，然后重新启动 GPU"
+    return msg
 
 
-async def forward_comfy():
-    """ComfyUI portunu SSH ana bağlantısı üzerinden sunucuya yönlendirir."""
-    await run(*SSH, "-O", "forward", "-L", f"127.0.0.1:{COMFY_PORT}:127.0.0.1:{COMFY_PORT}", "colab", timeout=30)
+class Runtime:
+    def __init__(self) -> None:
+        self.state = "off"          # off | starting | ready | stopping | error
+        self.step = "GPU 已关闭"
+        self.error: str | None = None
+        self.gpu_name: str | None = None
+        self.vram_used_mb = 0
+        self.vram_total_mb = 0
+        self.disk_free_gb = 0.0
+        self.disk_total_gb = 0.0
+        self.models: dict = {}
+        self.setup_step: str | None = None
+        self.started_at: float | None = None
+        self.last_used: float = time.time()
+        self.active_jobs = 0
+        self.warm: set[str] = set()
+        self.log: list[str] = []
 
+        self._lock = asyncio.Lock()
+        self._pack_locks: dict[str, asyncio.Lock] = {}
+        self._ssh_flags: list[str] = []
+        self._ssh_host: str = ""
+        self._tunnel: subprocess.Popen | None = None
 
-async def connect(attempts=3, delay=5):
-    """SSH ana bağlantısını kurar. Yeni runtime'da Colab'ın SSH köprüsü ara sıra mesaj vermeden
-    kapanıyor (aynı runtime'a hemen ardından bağlanılabiliyor); birkaç kez denenir."""
-    for attempt in range(1, attempts + 1):
-        try:
-            return await run(*SSH, "-fN", "colab", timeout=90)
-        except RuntimeError:
-            if attempt == attempts:
-                raise
-            log(f"SSH bağlantısı kurulamadı, yeniden deneniyor ({attempt}/{attempts - 1})")
-            await asyncio.sleep(delay)
+    def _log(self, msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)
+        self.log = (self.log + [line])[-200:]
 
+    def touch(self) -> None:
+        self.last_used = time.time()
 
-def start(pack="image"):
-    """Runtime'ı arka planda açar; zaten açılıyorsa ya da açıksa bir şey yapmaz. pack: açılışı
-    tetikleyen işin model paketi; ilk o iner ve hazır sayılmak için yalnızca o beklenir. None: işin
-    indirilecek paketi yok (yazıya dökme; Whisper'ı eklenti kendisi indirir), hiçbir paket beklenmez."""
-    global _start_task
-    if state["phase"] in ("off", "error"):
-        set_phase("starting", STEPS[0][1])
+    def status(self) -> dict:
         now = time.time()
-        state["startup"] = {"step": 0, "started_at": now, "step_started_at": now, "pack": pack if pack in PACKS or pack is None else "image"}
-        _start_task = asyncio.create_task(_start())
+        return {
+            "state": self.state,
+            "step": self.step,
+            "error": self.error,
+            "gpu_tier": config.GPU_TIER,
+            "gpu_name": self.gpu_name,
+            "vram_used_mb": self.vram_used_mb,
+            "vram_total_mb": self.vram_total_mb,
+            "disk_free_gb": self.disk_free_gb,
+            "disk_total_gb": self.disk_total_gb,
+            "models": self.models,
+            "setup_step": self.setup_step,
+            "uptime_s": int(now - self.started_at) if self.started_at else 0,
+            "idle_s": int(now - self.last_used) if self.state == "ready" and self.active_jobs == 0 else 0,
+            "idle_timeout_s": IDLE_TIMEOUT,
+            "active_jobs": self.active_jobs,
+            "warm": sorted(self.warm),
+            "log": self.log[-40:],
+        }
 
+    # --- Low-level command execution ---------------------------------------
 
-COMFY_PROCESS = "pgrep -f '^python[0-9.]* main[.]py' >/dev/null && echo alive || echo dead"
+    def _cmd(self, *args: str) -> list[str]:
+        if args and args[0] == "ssh" and self._ssh_host:
+            return ["ssh", *self._ssh_flags, self._ssh_host, *args[1:]]
+        return [config.COLAB_BIN, "--gpu", config.GPU_TIER, *args]
 
-
-async def wait_comfy_ready():
-    """ComfyUI /queue'ya yanıt verene kadar bekler. Süreç ölmüşse (kurulum hatası, çökme) 10 dakika
-    beklemeden comfy.log'un sonuyla hemen hata verir."""
-    deadline = time.time() + 600
-    async with ClientSession(timeout=ClientTimeout(total=5)) as http:
-        while time.time() < deadline:
+    async def _run(self, *args: str, timeout: int = 120) -> str:
+        cmd = self._cmd(*args)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError as e:
             try:
-                async with http.get(f"{COMFY_URL}/queue") as r:
-                    if r.status == 200:
-                        return
-            except OSError:
+                proc.kill()
+            except ProcessLookupError:
                 pass
-            if (await run(*SSH, "colab", COMFY_PROCESS, timeout=20, quiet=True)).strip() != "alive":
-                tail = await run(*SSH, "colab", "tail -n 40 /content/comfy.log", timeout=30, quiet=True)
-                raise RuntimeError(f"ComfyUI süreci öldü:\n{tail}")
-            await asyncio.sleep(3)
-    tail = await run(*SSH, "colab", "tail -n 40 /content/comfy.log", timeout=30)
-    raise RuntimeError(f"ComfyUI açılmadı:\n{tail}")
+            raise RuntimeError(f"执行超时 ({timeout}s): {' '.join(args[:2])}") from e
+        if proc.returncode != 0:
+            msg = _clean_err(err.decode(errors="replace") or out.decode(errors="replace"))
+            raise RuntimeError(msg or f"命令执行失败 ({proc.returncode}): {' '.join(args[:2])}")
+        return out.decode(errors="replace").strip()
 
+    async def ssh(self, remote_cmd: str, timeout: int = 120) -> str:
+        return await self._run("ssh", remote_cmd, timeout=timeout)
 
-WARMUP_POLL_SECONDS = 10
-WARMUP_DEADLINE_SECONDS = 1800  # görsel paketi bu süre içinde inmezse ön ısıtma bırakılır
+    def upload_file(self, local_path: Path, remote_path: str, timeout: int = 180) -> None:
+        """Stream a local file to `remote_path` on the Colab instance over SSH."""
+        parent = str(Path(remote_path).parent)
+        cmd = self._cmd("ssh", f"mkdir -p {shlex.quote(parent)} && cat > {shlex.quote(remote_path)}")
+        with open(local_path, "rb") as f:
+            proc = subprocess.run(cmd, stdin=f, capture_output=True, timeout=timeout)
+        if proc.returncode != 0:
+            err = proc.stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"上传文件失败 ({local_path.name}): {err}")
 
+    def download_file(self, remote_path: str, local_path: Path, timeout: int = 300) -> None:
+        """Stream a remote file from the Colab instance to `local_path` atomically."""
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        part = local_path.with_suffix(local_path.suffix + ".part")
+        cmd = self._cmd("ssh", f"cat {shlex.quote(remote_path)}")
+        with open(part, "wb") as f:
+            proc = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, timeout=timeout)
+        if proc.returncode != 0 or not part.exists() or part.stat().st_size == 0:
+            part.unlink(missing_ok=True)
+            err = proc.stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"下载文件失败 ({remote_path}): {err}")
+        part.replace(local_path)
 
-async def pack_state(pack):
-    """"done" | "failed" | "pending": paketin inme durumu tek ssh çağrısında okunur."""
-    out = await run(
-        *SSH, "colab",
-        f"if [ -f /content/packs/{pack}.done ]; then echo done; "
-        f"elif [ -f /content/packs/{pack}.error ]; then echo failed; else echo pending; fi",
-        timeout=30, quiet=True,
-    )
-    return out.strip() or "pending"
+    async def _load_ssh_config(self) -> None:
+        raw = await self._run("ssh", "--raw", timeout=180)
+        tokens = shlex.split(raw)
+        if not tokens or tokens[0] != "ssh":
+            raise RuntimeError(f"无法解析 ssh --raw 输出: {raw[:120]}")
+        self._ssh_flags = [
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=300",
+            "-o", "ControlPath=/tmp/colab-ssh-%C",
+            "-o", "ConnectTimeout=15",
+            *tokens[1:-1],
+        ]
+        self._ssh_host = tokens[-1]
 
+    def _ship_station_sync(self, tar_cmd: list[str], ssh_cmd: list[str]) -> tuple[int, str]:
+        t_proc = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE)
+        s_proc = subprocess.Popen(ssh_cmd, stdin=t_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert t_proc.stdout is not None
+        t_proc.stdout.close()
+        _, err = s_proc.communicate(timeout=60)
+        t_proc.wait(timeout=5)
+        return s_proc.returncode, err.decode(errors="replace").strip()
 
-async def warmup():
-    """Görsel modellerini (UNET, CLIP, VAE) arka planda GPU'ya yükler (~55 sn). Kuyrukta iş yokken ve
-    görsel paketi inmişken çalışır (GPU'yu başka bir iş açtırdıysa paket sonradan iner; o zaman beklenir).
-    Kullanıcı iş gönderirse hemen kesilir ve iş bitince yeniden denenir; boşta sayacını uzatmaz.
-    Paket inemezse ya da WARMUP_DEADLINE_SECONDS içinde gelmezse vazgeçer: sonsuz yoklamada her turda
-    ssh açıp durmaz."""
-    deadline = time.time() + WARMUP_DEADLINE_SECONDS
-    while state["phase"] == "ready" and "image" not in warm:
-        try:
-            if not _has_pending():
-                if "image" not in local_modes:
-                    pack = await pack_state("image")
-                    if pack == "failed":
-                        log("görsel paketi inemedi, ön ısıtma yapılmıyor")
-                        return
-                    if pack != "done":
-                        if time.time() > deadline:
-                            log("görsel paketi beklendi, gelmedi; ön ısıtma bırakıldı")
-                            return
-                        await asyncio.sleep(WARMUP_POLL_SECONDS)
-                        continue
-                    local_modes.add("image")
-                if await _warm_image() != "interrupted":
-                    return
-        except RuntimeError as e:
-            log(f"ön ısıtma atlandı: {e}")
-            return
-        await asyncio.sleep(WARMUP_POLL_SECONDS)
-
-
-async def _warm_image():
-    """"done" | "interrupted" (kullanıcı işi geldi) | "failed"."""
-    global warming
-    import workflows
-    warming = True
-    try:
-        async with ClientSession(timeout=ClientTimeout(total=10)) as http:
-            async with http.post(f"{COMFY_URL}/prompt", json={"prompt": workflows.image_warmup()}) as r:
-                if r.status != 200:
-                    return "failed"
-                pid = (await r.json())["prompt_id"]
-            while state["phase"] == "ready":
-                if _has_pending():
-                    await http.post(f"{COMFY_URL}/interrupt")
-                    return "interrupted"
-                async with http.get(f"{COMFY_URL}/history/{pid}") as r:
-                    h = await r.json()
-                if pid in h:
-                    if h[pid].get("status", {}).get("completed"):
-                        warm.add("image")
-                        log("görsel modeli önceden yüklendi")
-                        return "done"
-                    return "failed"
-                await asyncio.sleep(0.5)
-            return "failed"
-    except Exception as e:
-        log(f"ön ısıtma atlandı: {e}")
-        return "failed"
-    finally:
-        warming = False
-
-
-def _owned():
-    return json.loads(OWNED_FILE.read_text()) if OWNED_FILE.exists() else []
-
-
-def _own(endpoint):
-    OWNED_FILE.write_text(json.dumps(_owned() + [endpoint]))
-
-
-async def reap_owned():
-    """Stüdyonun açtığı ama hâlâ açık kalan runtime'ları bırakır (ör. yarım kalmış bir açılıştan
-    artakalan, artık "comfy" adını taşımayan oturum). Yalnızca kendi açtıklarına dokunur."""
-    owned = _owned()
-    if not owned:
-        return
-    sessions = await run(COLAB, "sessions", timeout=60, quiet=True)
-    alive = [e for e in owned if e in sessions]
-    for e in alive:
-        log(f"stüdyonun açık kalan runtime'ı kapatılıyor: {e}")
-        await run(config.colab_python(), "-c", f"from colab_cli.common import state; state.client.unassign({e!r})", timeout=60)
-    # Bu arada yeni bir açılış kendi runtime'ını eklemiş olabilir; yalnızca incelenenler silinir.
-    OWNED_FILE.write_text(json.dumps([e for e in _owned() if e not in owned]))
-
-
-async def stop_runtime():
-    """Runtime'ı kapatır; kredi harcamasın diye bir adım başarısız olsa da diğerlerini dener, yerel
-    durumu her durumda temizler. Bir adım başarısızsa sonunda RuntimeError verir; stüdyonun açtığı
-    runtime bırakılamadıysa watchdog onu reap_owned ile yeniden dener."""
-    errors = []
-    if SSH_CONF.exists():
-        try:
-            await run(*SSH, "-O", "exit", "colab", timeout=20)
-        except RuntimeError as e:
-            log(str(e))  # ana bağlantı zaten yoksa olağan
-    try:
-        sessions = await run(COLAB, "sessions", timeout=60)
-        if f"[{SESSION}]" in sessions:
-            await run(COLAB, "stop", "-s", SESSION, timeout=120)
-    except RuntimeError as e:
-        errors.append(e)
-    try:
-        await reap_owned()
-    except RuntimeError as e:
-        errors.append(e)
-    state["last_busy"] = None
-    state["start_balance"] = None
-    state["ready_at"] = None
-    metrics.clear()
-    local_modes.clear()
-    warm.clear()
-    packs.clear()
-    _pack_samples.clear()
-    setup_phase["text"] = None
-    global warming
-    warming = False
-    if errors:
-        raise RuntimeError(f"GPU kapatılamadı, yeniden denenecek: {errors[-1]}")
-
-
-def update_packs(text):
-    """Runtime'dan okunan progress.json'u işler; dosya henüz yoksa (indirme başlamadı) boş gelir."""
-    if not text.strip():
-        return
-    packs.clear()
-    packs.update(json.loads(text))
-    sample = (time.time(), sum(p["done"] for p in packs.values()))
-    if _pack_samples:
-        _pack_samples[1:] = [sample]
-    else:
-        _pack_samples.append(sample)
-
-
-def download_rate():
-    if len(_pack_samples) < 2:
-        return None
-    (t0, b0), (t1, b1) = _pack_samples
-    return (b1 - b0) / (t1 - t0) if t1 > t0 and b1 > b0 else None
-
-
-def pack_status(pack):
-    """Paketin inme durumu: oran, bayt, hız ve kalan süre (paketler sırayla iner; öndekiler de beklenir)."""
-    p = packs.get(pack)
-    if p is None:
-        return None
-    rate = download_rate()
-    ahead = 0
-    for name, q in packs.items():  # sırayla iner: bu paketten öncekilerin kalanı da beklenir
-        ahead += q["total"] - q["done"]
-        if name == pack:
-            break
-    return {
-        "total": p["total"], "done": p["done"], "fraction": p["done"] / p["total"] if p["total"] else 1.0,
-        "rate": rate, "eta": round(ahead / rate) if rate and ahead else (0 if not ahead else None),
-    }
-
-
-async def poll_packs():
-    """Açılışta kurulum betiği sürerken indirme ilerlemesini ve kurulum aşamasını okur (gösterim için)."""
-    while True:
-        try:
-            out = await run(*SSH, "colab", "cat /content/packs/progress.json 2>/dev/null; echo; cat /content/setup_phase 2>/dev/null; true",
-                            timeout=15, quiet=True)
-            lines = out.split("\n")
-            update_packs(lines[0])
-            setup_phase["text"] = (lines[1].strip() if len(lines) > 1 else "") or None
-        except RuntimeError:
-            pass  # bağlantı anlık koptuysa bir sonraki okumada güncellenir
-        await asyncio.sleep(3)
-
-
-async def ensure_models(pack, on_wait=None):
-    """İş türünün model paketi runtime'da inene kadar bekler; beklerken on_wait(pack_status) çağrılır
-    (on_wait hata fırlatırsa, ör. iş iptal edildiyse, bekleme biter). Paket inmiyorsa indirme sırası
-    bu pakete verilir (models.py, dosya sınırında ona geçer). İndirici öldüyse ya da MODEL_STALL_SECONDS
-    boyunca inen bayt artmadıysa hata verilir: yoksa iş sonsuza kadar "çalışıyor" kalır ve GPU kapanmaz."""
-    if pack not in local_modes:
-        await run(*SSH, "colab", f"mkdir -p /content/packs && echo {pack} > /content/packs/priority", timeout=30, quiet=True)
-    last_bytes, last_moved = None, time.time()
-    while pack not in local_modes:
-        if on_wait:
-            on_wait(pack_status(pack))
-        total_bytes = sum(p["done"] for p in packs.values())
-        if total_bytes != last_bytes:
-            last_bytes, last_moved = total_bytes, time.time()
-        elif time.time() - last_moved > MODEL_STALL_SECONDS:
-            raise RuntimeError(f"{PACK_LABELS.get(pack, pack)} modelleri {MODEL_STALL_SECONDS // 60} dakikadır inmiyor, indirme takıldı")
-        out = await run(
-            *SSH, "colab",
-            f"if [ -f /content/packs/{pack}.done ]; then echo done; "
-            f"elif [ -f /content/packs/{pack}.error ]; then tail -3 /content/packs/{pack}.error; exit 1; "
-            # [.] kalıbın bu kabuğun kendi komut satırıyla eşleşmesini önler
-            f"elif ! pgrep -f 'station/models[.]py' >/dev/null && [ ! -f /content/packs/{pack}.done ]; then "
-            f"echo 'model indirici durdu:'; tail -5 /content/models.log; exit 1; fi",
-            timeout=30, quiet=True,
+    async def _ship_station(self) -> None:
+        extra: list[str] = []
+        if MODELS_TOML.is_file():
+            extra = ["-C", str(MODELS_TOML.parent), MODELS_TOML.name]
+        tar_cmd = ["tar", "-C", str(STATION_DIR.parent), "-cf", "-", "station", *extra]
+        ssh_cmd = self._cmd(
+            "ssh",
+            "mkdir -p /content && tar -xf - -C /content "
+            "&& ([ ! -f /content/models.toml ] || mv /content/models.toml /content/station/models.default.toml) "
+            "&& chmod +x /content/station/runtime_setup.sh",
         )
-        if out.strip() == "done":
-            local_modes.add(pack)
-        else:
-            await asyncio.sleep(MODEL_POLL_SECONDS)
+        rc, err = await asyncio.to_thread(self._ship_station_sync, tar_cmd, ssh_cmd)
+        if rc != 0:
+            raise RuntimeError(f"station 同步失败: {err}")
 
+    # --- Lifecycle ---------------------------------------------------------
 
-def begin_stop(reason):
-    """Kapanışı senkron başlatır: açılış sürüyorsa iptal eder ve fazı hemen "stopping" yapar. İsteği
-    bekletmemek için (nginx 120 sn) kapanışın kendisi run_stop ile arka planda yürütülür."""
-    global _start_task
-    if _start_task and not _start_task.done():
-        _start_task.cancel()
-    set_phase("stopping", reason)
+    async def ensure_ready(self) -> None:
+        if self.state == "ready":
+            self.touch()
+            return
+        async with self._lock:
+            if self.state == "ready":
+                self.touch()
+                return
+            await self._boot()
 
-
-async def run_stop(reason):
-    """Kapanışı yürütür; begin_stop ile aynı işi bir kez daha (zararsız) yapar ki tek başına da
-    kullanılabilsin."""
-    begin_stop(reason)
-    try:
-        await stop_runtime()
-    except RuntimeError as e:
-        set_phase("error", short_error(e))
-        return
-    set_phase("off", reason)
-
-
-async def stop(reason):
-    await run_stop(reason)
-
-
-def touch():
-    """Stüdyo bir iş gönderdiğinde boşta sayacını sıfırlar."""
-    if state["phase"] == "ready":
-        state["last_busy"] = time.time()
-
-
-def toggle_auto():
-    state["auto_shutdown"] = not state["auto_shutdown"]
-    touch()
-
-
-def parse_usage(text):
-    balance = re.search(r"Current balance:\s*([\d.]+)", text)
-    rate = re.search(r"Usage rate:\s*([\d.]+)", text)
-    if not balance or not rate:
-        raise RuntimeError(f"colab usage çıktısı okunamadı: {text[-200:]}")
-    return {"balance": float(balance.group(1)), "rate": float(rate.group(1))}
-
-
-async def log_crash_context():
-    """Runtime kapanmadan önce ComfyUI'nin son kaydını ve bellek durumunu kayda düşer."""
-    try:
-        await run(*SSH, "colab", "pgrep -af main.py; free -g; tail -40 /content/comfy.log", timeout=20)
-    except RuntimeError as e:
-        log(f"çökme kaydı alınamadı: {e}")
-
-
-async def watchdog(has_pending_jobs, on_credits):
-    """Kredi, boşta kapatma ve ComfyUI çökmesini izler. Bir turdaki beklenmedik hata döngüyü
-    durdurmaz: durursa boşta kapatma da durur ve GPU kredi harcamaya devam eder."""
-    global _has_pending
-    _has_pending = has_pending_jobs
-    async with ClientSession(timeout=ClientTimeout(total=10)) as http:
-        while True:
-            try:
-                await _watch_once(http, has_pending_jobs, on_credits)
-            except Exception as e:
-                log(f"izleme turu başarısız, sonraki turda yeniden denenecek: {short_error(e, 300)}")
-            await asyncio.sleep(POLL_SECONDS)
-
-
-async def _watch_once(http, has_pending_jobs, on_credits):
-    try:
-        state["credits"] = parse_usage(await run(COLAB, "usage", timeout=60, quiet=True))
-        on_credits(state["credits"])
-    except RuntimeError as e:
-        state["credits"] = {"error": str(e)[:200]}
-    if state["phase"] in ("off", "error"):
-        await reap_owned()
-    if state["phase"] != "ready":
-        return
-    try:
-        async with http.get(f"{COMFY_URL}/queue") as r:
-            q = await r.json()
-        if (q["queue_running"] and not warming) or q["queue_pending"] or has_pending_jobs():
-            state["last_busy"] = time.time()
-        elif state["auto_shutdown"] and time.time() - state["last_busy"] >= IDLE_MINUTES * 60:
-            await stop(f"{IDLE_MINUTES} dk boşta kaldı, GPU kapatıldı")
-    except OSError as e:
-        # Büyük model yüklerken ComfyUI saniyelerce yanıt vermeyebilir; süreç
-        # yaşıyorsa meşgul sayılır, yalnızca süreç ya da bağlantı yoksa kapatılır.
+    async def _boot(self) -> None:
+        self.state = "starting"
+        self.error = None
+        self.warm.clear()
+        self.setup_step = None
+        boot_t0 = time.time()
         try:
-            await run(*SSH, "colab", "pgrep -f '^python[0-9.]* main[.]py'", timeout=20, quiet=True)
-            state["last_busy"] = time.time()
-            # Port kapalıysa (bağlantı reddedildi) SSH ana bağlantısı kopmuş, sonraki ssh
-            # komutu yeni ana bağlantıyı yönlendirmesiz açmıştır: yönlendirme yeniden kurulur.
-            if isinstance(e, ClientConnectorError) and isinstance(e.os_error, ConnectionRefusedError):
-                log("ComfyUI portu kapalı (SSH bağlantısı yenilenmiş), yönlendirme yeniden kuruluyor")
-                await forward_comfy()
-        except RuntimeError:
-            set_phase("stopping", "ComfyUI'ye ulaşılamıyor, kapatılıyor")
-            await log_crash_context()
+            _check_host_tools()
+
+            self.step = "正在分配 GPU"
+            self._log(f"正在请求 Colab {config.GPU_TIER.upper()} 运行时...")
+            await self._load_ssh_config()
+
+            self.step = "正在连接"
+            gpu = await self.ssh(
+                "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits", timeout=60
+            )
+            parts = [p.strip() for p in gpu.split(",")]
+            self.gpu_name = parts[0]
+            self.vram_total_mb = int(float(parts[1])) if len(parts) > 1 else 0
+            self._log(f"GPU 已连接: {self.gpu_name} ({self.vram_total_mb} MB)")
+
+            await self._ship_station()
+            done = await self.ssh("test -f /content/.setup_done && echo yes || echo no")
+            if done != "yes":
+                self.step = "正在下载模型并部署 ComfyUI 与 FaceFusion"
+                self._log("开始首次环境初始化（下载图片主模型 + 部署 ComfyUI & FaceFusion 双补丁）...")
+                await self._run_setup_Remote()
+
+            self.step = "正在启动 ComfyUI"
+            self.setup_step = None
+            await self._start_comfy()
+            await self._start_tunnel()
+            await self._wait_comfy_http()
+            await self._refresh_telemetry()
+
+            self.state = "ready"
+            self.step = "GPU 已就绪"
+            self.started_at = time.time()
+            self.touch()
+            tracker.record_startup("boot", time.time() - boot_t0)
+            self._log(f"GPU 已就绪（耗时 {int(time.time() - boot_t0)}s）")
+        except Exception as e:
+            self.state = "error"
+            self.error = str(e)
+            self.step = f"错误: {e}"
+            self._log(f"错误: {e}")
+            self._kill_tunnel()
+            if self._ssh_host:
+                self._log("启动失败，正在释放远端 GPU 以避免空转扣费...")
+                await self._force_disconnect("启动失败，正在关闭")
+            raise
+
+    async def _run_setup_Remote(self) -> None:
+        hf = shlex.quote(config.HF_TOKEN)
+        await self.ssh(
+            "pgrep -f '/content/station/runtime_setup.sh' >/dev/null || "
+            f"nohup env HF_TOKEN={hf} bash /content/station/runtime_setup.sh image "
+            "> /content/setup.log 2>&1 < /dev/null &"
+        )
+        while True:
+            await asyncio.sleep(4)
+            await self._refresh_telemetry()
+            state = await self.ssh(
+                "if [ -f /content/.setup_done ]; then echo done; "
+                "elif pgrep -f '/content/station/runtime_setup.sh' >/dev/null; then echo running; "
+                "else echo failed; fi",
+                timeout=30,
+            )
+            if state == "done":
+                self._log("runtime_setup.sh 执行完成")
+                return
+            if state == "failed":
+                tail = await self.ssh("tail -n 25 /content/setup.log 2>/dev/null || true", timeout=20)
+                raise RuntimeError(f"环境初始化失败:\n{tail[-600:]}")
+
+    async def _start_comfy(self) -> None:
+        cmd = (
+            "pgrep -f '/content/ComfyUI/main.py' >/dev/null || "
+            "nohup python3 /content/ComfyUI/main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch "
+            "> /content/comfy.log 2>&1 < /dev/null &"
+        )
+        await self.ssh(cmd)
+
+    def _spawn_tunnel_proc(self) -> None:
+        self._kill_tunnel()
+        subprocess.run(
+            ["ssh", *self._ssh_flags, "-O", "exit", self._ssh_host],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        )
+        cmd = [
+            "ssh", *self._ssh_flags, "-N",
+            "-o", "ControlMaster=no", "-o", "ControlPath=none",
+            "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=3",
+            "-o", "ExitOnForwardFailure=yes",
+            "-L", f"127.0.0.1:{COMFY_PORT}:127.0.0.1:8188",
+            self._ssh_host,
+        ]
+        self._tunnel = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    async def _start_tunnel(self) -> None:
+        await asyncio.to_thread(self._spawn_tunnel_proc)
+        await asyncio.sleep(1.0)
+        if self._tunnel and self._tunnel.poll() is not None:
+            err = (self._tunnel.stderr.read().decode(errors="replace") if self._tunnel.stderr else "").strip()
+            raise RuntimeError(f"SSH 隧道建立失败: {err or self._tunnel.returncode}")
+
+    def _kill_tunnel(self) -> None:
+        if self._tunnel and self._tunnel.poll() is None:
+            self._tunnel.terminate()
             try:
-                await stop_runtime()
-            except RuntimeError as stop_error:
-                log(short_error(stop_error))  # bırakılamayan runtime sonraki turda reap_owned ile denenir
-            set_phase("error", f"ComfyUI'ye ulaşılamıyor, runtime kapatıldı: {e!r}")
+                self._tunnel.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._tunnel.kill()
+        self._tunnel = None
+        if self._ssh_host:
+            subprocess.run(
+                ["ssh", *self._ssh_flags, "-O", "exit", self._ssh_host],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+            )
 
+    async def _wait_comfy_http(self) -> None:
+        for i in range(90):
+            if self._Comfy_alive():
+                return
+            if i % 5 == 4:
+                alive = await self.ssh("pgrep -f '/content/ComfyUI/main.py' >/dev/null && echo y || echo n")
+                if alive != "y":
+                    tail = await self.ssh("tail -n 20 /content/comfy.log 2>/dev/null || true")
+                    raise RuntimeError(f"ComfyUI 进程异常退出:\n{tail[-500:]}")
+            await asyncio.sleep(2)
+        tail = await self.ssh("tail -n 20 /content/comfy.log 2>/dev/null || true")
+        raise RuntimeError(f"ComfyUI 启动超时:\n{tail[-500:]}")
 
-METRICS_CMD = (
-    "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits; "
-    "free -b | awk '/^Mem:/{print $2, $7}'; "
-    "df -B1 --output=size,used /content | tail -1; "
-    "cat /content/packs/progress.json 2>/dev/null || true"
-)
+    def _Comfy_alive(self) -> bool:
+        try:
+            with urllib.request.urlopen(f"{COMFY_URL}/system_stats", timeout=3) as r:
+                return r.status == 200
+        except Exception:
+            return False
 
-
-async def metrics_loop():
-    """GPU açıkken GPU, VRAM, RAM ve disk kullanımını tek SSH bağlantısı üzerinden okur."""
-    while True:
-        if state["phase"] == "ready":
+    async def _force_disconnect(self, reason: str) -> None:
+        for attempt in range(3):
             try:
-                out = (await run(*SSH, "colab", METRICS_CMD, timeout=15, quiet=True)).split("\n")
-                util, vram_used, vram_total, temp = (float(x) for x in out[0].split(","))
-                ram_total, ram_avail = (int(x) for x in out[1].split())
-                disk_total, disk_used = (int(x) for x in out[2].split())
-                update_packs("\n".join(out[3:]))
-                metrics.append({
-                    "t": time.time(),
-                    "gpu": util,
-                    "temp": temp,
-                    "vram_used": vram_used * 2**20,
-                    "vram_total": vram_total * 2**20,
-                    "ram_used": ram_total - ram_avail,
-                    "ram_total": ram_total,
-                    "disk_used": disk_used,
-                    "disk_total": disk_total,
-                })
-            except (RuntimeError, ValueError, IndexError) as e:
-                log(f"sistem bilgisi okunamadı: {e}")
-        await asyncio.sleep(METRICS_SECONDS)
+                await self._run("disconnect", timeout=30)
+                self._ssh_host = ""
+                self._ssh_flags = []
+                self._log(f"GPU 已断开连接 ({reason})")
+                return
+            except Exception as e:
+                self._log(f"disconnect 重试 {attempt + 1}/3: {e}")
+                await asyncio.sleep(2)
+        self._log("警告: colab disconnect 未确认，将继续由看门狗重试")
+
+    async def stop(self, reason: str = "手动关闭", preserve_error: bool = False) -> None:
+        async with self._lock:
+            prev_error = self.error if preserve_error else None
+            self.state = "stopping"
+            self.step = f"正在关闭 ({reason})"
+            self._log(f"正在关闭 GPU: {reason}")
+            self._kill_tunnel()
+            try:
+                await self._run("disconnect", timeout=30)
+            except Exception as e:
+                self._log(f"disconnect 错误: {e}")
+                self.state = "error"
+                self.error = prev_error or f"GPU 无法关闭，将自动重试: {e}"
+                self.step = f"错误: {self.error}"
+                return
+            self._ssh_host = ""
+            self._ssh_flags = []
+            self.state = "error" if prev_error else "off"
+            self.error = prev_error
+            self.step = f"错误: {prev_error}" if prev_error else "GPU 已关闭"
+            self.gpu_name = None
+            self.vram_used_mb = 0
+            self.vram_total_mb = 0
+            self.started_at = None
+            self.warm.clear()
+            self._log("GPU 已关闭")
+
+    async def disconnect_on_shutdown(self) -> None:
+        self._kill_tunnel()
+        if self.state in ("ready", "starting", "error") and self._ssh_host:
+            await self._force_disconnect("服务停止")
+
+    # --- Model pack download & telemetry -----------------------------------
+
+    async def ensure_models(self, pack: str, on_progress=None) -> None:
+        lock = self._pack_locks.setdefault(pack, asyncio.Lock())
+        async with lock:
+            await self._refresh_telemetry()
+            if self.models.get("packs", {}).get(pack, {}).get("ready"):
+                return
+            label = PACK_LABELS.get(pack, pack)
+            self._log(f"开始按需下载 {label} 模型包...")
+            pack_t0 = time.time()
+            last_done = -1.0
+            last_advance = time.time()
+            hf = shlex.quote(config.HF_TOKEN)
+            qpack = shlex.quote(pack)
+            await self.ssh(
+                f"pgrep -f 'models.py.*{qpack}' >/dev/null || "
+                f"nohup env HF_TOKEN={hf} /content/hfenv/bin/python /content/station/models.py {qpack} "
+                ">> /content/models.log 2>&1 < /dev/null &"
+            )
+            while True:
+                await asyncio.sleep(2)
+                await self._refresh_telemetry()
+                p = self.models.get("packs", {}).get(pack, {})
+                if on_progress:
+                    on_progress(p)
+                if p.get("ready"):
+                    tracker.record_startup(f"pack:{pack}", time.time() - pack_t0)
+                    self._log(f"{label} 模型包已就绪")
+                    return
+                if p.get("error"):
+                    raise RuntimeError(f"{label} 模型下载失败: {p['error']}")
+                done = float(p.get("done_gb") or 0.0)
+                cur = p.get("current") or ""
+                if done > last_done or (cur and time.time() - float(self.models.get("updated_at") or 0) < 30):
+                    last_done = done
+                    last_advance = time.time()
+                elif time.time() - last_advance > SETUP_STALL_TIMEOUT:
+                    await self.ssh("pkill -f '/content/station/models.py' || true")
+                    raise RuntimeError(f"{label} 模型连续 {SETUP_STALL_TIMEOUT // 60} 分钟无进度，下载卡死")
+                running = await self.ssh(f"pgrep -f 'models.py.*{qpack}' >/dev/null && echo y || echo n")
+                if running != "y":
+                    await self._refresh_telemetry()
+                    p = self.models.get("packs", {}).get(pack, {})
+                    if p.get("ready"):
+                        tracker.record_startup(f"pack:{pack}", time.time() - pack_t0)
+                        return
+                    tail = await self.ssh("tail -n 20 /content/models.log 2>/dev/null || true")
+                    raise RuntimeError(f"{label} 模型未完成下载:\n{tail[-400:]}")
+
+    async def _refresh_telemetry(self) -> None:
+        try:
+            raw = await self.ssh(
+                "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || echo '0,0'; "
+                "echo '---'; "
+                "cat /content/models/.status.json 2>/dev/null || echo '{}'; "
+                "echo '---'; "
+                "cat /content/setup.step 2>/dev/null || true; "
+                "echo '---'; "
+                "stat -c '%n %s' /content/models/*/*.part /content/models/*/.hfcache/*.incomplete 2>/dev/null || true",
+                timeout=15,
+            )
+            sections = raw.split("---")
+            vram_line = sections[0].strip()
+            status_raw = sections[1].strip() if len(sections) > 1 else "{}"
+            step_line = sections[2].strip() if len(sections) > 2 else ""
+            parts_raw = sections[3].strip() if len(sections) > 3 else ""
+            used, total = [int(float(x.strip())) for x in vram_line.split(",")[:2]]
+            self.vram_used_mb = used
+            if total:
+                self.vram_total_mb = total
+            self.setup_step = step_line or None
+            data = json.loads(status_raw or "{}")
+            if data:
+                part_gb = 0.0
+                for ln in parts_raw.splitlines():
+                    toks = ln.rsplit(" ", 1)
+                    if len(toks) == 2 and toks[1].isdigit():
+                        part_gb += int(toks[1]) / 1e9
+                for p in data.get("packs", {}).values():
+                    if p.get("current") and not p.get("ready"):
+                        total_p = float(p.get("total_gb") or 0)
+                        base = float(p.get("done_gb") or 0)
+                        p["done_gb"] = round(min(total_p, base + part_gb), 2)
+                        p["writing"] = part_gb < 0.05
+                self.models = data
+                self.disk_free_gb = data.get("disk_free_gb", self.disk_free_gb)
+                self.disk_total_gb = data.get("disk_total_gb", self.disk_total_gb)
+        except Exception:
+            pass
+
+    async def fetch_usage(self) -> dict:
+        cmd = [config.COLAB_BIN, "usage", "--json"]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            msg = _clean_err(err.decode(errors="replace") or out.decode(errors="replace"))
+            raise RuntimeError(msg or "无法读取 colab usage 输出")
+        try:
+            data = json.loads(out.decode(errors="replace"))
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"无法解析 colab usage 输出: {e}") from e
+        rates = data.get("burn_rates_hourly") or {}
+        if "a100" in rates and "g2-standard-12" not in rates:
+            rates["g2-standard-12"] = round(rates["a100"] * 0.4, 2)
+        return data
+
+    # --- Watchdog ----------------------------------------------------------
+
+    async def watchdog_loop(self) -> None:
+        health_fails = 0
+        while True:
+            await asyncio.sleep(20)
+            if self.state == "error" and self._ssh_host:
+                await self._force_disconnect("错误恢复")
+                continue
+            if self.state != "ready":
+                health_fails = 0
+                continue
+            if self._tunnel is None or self._tunnel.poll() is not None:
+                try:
+                    self._log("SSH 隧道断开，正在重连...")
+                    await self._start_tunnel()
+                except Exception as e:
+                    self._log(f"隧道重连失败: {e}")
+
+            alive = await asyncio.to_thread(self._Comfy_alive)
+            if alive:
+                health_fails = 0
+                await self._refresh_telemetry()
+            else:
+                health_fails += 1
+                self._log(f"ComfyUI 健康检查失败 ({health_fails}/{HEALTH_FAIL_LIMIT})")
+                if health_fails >= HEALTH_FAIL_LIMIT and self.active_jobs == 0:
+                    try:
+                        await self._start_comfy()
+                        await self._start_tunnel()
+                        if await asyncio.to_thread(self._Comfy_alive):
+                            health_fails = 0
+                            continue
+                    except Exception as e:
+                        self._log(f"ComfyUI 恢复失败 ({e})，正在释放 GPU...")
+                        self.error = f"ComfyUI 无法访问，已停止运行时: {e}"
+                        await self.stop("ComfyUI 无法访问，正在关闭", preserve_error=True)
+                        health_fails = 0
+                        continue
+
+            idle = time.time() - self.last_used
+            if self.active_jobs == 0 and idle >= IDLE_TIMEOUT:
+                await self.stop(f"空闲满 {config.IDLE_TIMEOUT_MIN} 分钟，自动关闭 GPU")
 
 
-def startup_progress():
-    s = state["startup"]
-    if s is None:
-        return None
-    exp = expected_durations()
-    now = time.time()
-    done = sum(exp[key] for key, _, _ in STEPS[: s["step"]])
-    current = exp[STEPS[s["step"]][0]]
-    # Adım beklenenden uzun sürerse çubuk %95'te bekler; kalan süre en az birkaç saniye görünür.
-    in_step = min(now - s["step_started_at"], current * 0.95)
-    remaining_step = current - in_step
-    # Kurulum adımında modeller inerken ComfyUI kurulur; hangisi geç biterse adım odur. Kalan süre
-    # öğrenilmiş adım süresinden ve indirmenin kalanından büyük olanı.
-    install = STEPS[s["step"]][0] == "install"
-    download = pack_status(s.get("pack", "image")) if install else None
-    if download and download["eta"]:
-        remaining_step = max(remaining_step, download["eta"])
-    later = sum(exp[key] for key, _, _ in STEPS[s["step"] + 1:])
-    remaining = remaining_step + later
-    # Çubuk geri gitmez (tahmin büyüse de).
-    s["last"] = max(s.get("last", 0.0), min((done + in_step) / (done + in_step + remaining), 0.99))
-    return {
-        "progress": s["last"],
-        "remaining_seconds": max(5, round(remaining)),
-        "elapsed_seconds": round(now - s["started_at"]),
-        "step": s["step"],
-        "steps": [label for _, label, _ in STEPS],
-        "step_elapsed_seconds": round(now - s["step_started_at"]),
-        "download": download,
-        "pack": s.get("pack", "image"),
-        "setup": setup_phase["text"] if install else None,
-    }
-
-
-def snapshot():
-    idle = None
-    if state["phase"] == "ready" and state["last_busy"]:
-        idle = int(time.time() - state["last_busy"])
-    c = state["credits"]
-    spent = None
-    if state["start_balance"] is not None and c and "balance" in c:
-        spent = state["start_balance"] - c["balance"]
-    return {
-        "phase": state["phase"],
-        "detail": state["detail"],
-        "auto_shutdown": state["auto_shutdown"],
-        "idle_seconds": idle,
-        "idle_minutes": IDLE_MINUTES,
-        "credits": c,
-        "session_spent": spent,
-        "session_seconds": round(time.time() - state["ready_at"]) if state["ready_at"] else None,
-        "startup": startup_progress(),
-        "gpu": GPU,
-        # Model paketleri ve anlık GPU kullanımı: işin gerçekten ilerlediği arayüzde görünsün.
-        "packs": {name: {**pack_status(name), "label": PACK_LABELS.get(name, name)} for name in packs},
-        "gpu_now": {k: metrics[-1][k] for k in ("t", "gpu", "vram_used", "vram_total")} if metrics and state["phase"] == "ready" else None,
-    }
+runtime = Runtime()

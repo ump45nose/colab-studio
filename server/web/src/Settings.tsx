@@ -1,402 +1,571 @@
-import { Dices, Info, Save, Trash2, X } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { EDIT_RESOLUTIONS, facesLabel, IMAGE_SIZES, MODEL3D_FACES, MODEL3D_RESOLUTIONS, MODEL3D_TEXTURES, MUSIC_SECONDS_RANGE, VIDEO_SECONDS_RANGE } from "./Chips";
-import { api, type ImageParams, type Mode, type Model3DParams, type ModelInfo, type MusicParams, type Preset, type SpeechParams, type VideoParams } from "./api";
-import { lang, t } from "./i18n";
+import { Bookmark, HelpCircle, RotateCcw, Shuffle, Trash2, X, Zap } from "lucide-react";
+import { ReactNode, useState } from "react";
+import {
+  EnhancerModel,
+  FaceSwapEngine,
+  ImageProfile,
+  Mode,
+  PixelBoost,
+  SwapperModel,
+  VideoProfile,
+} from "./api";
+import {
+  DEFAULT_FACESWAP,
+  DEFAULT_IMAGE,
+  DEFAULT_VIDEO,
+  EDIT_RES_INFO,
+  ENHANCER_OPTIONS,
+  FaceSwapSettings,
+  IMAGE_SIZE_INFO,
+  ImageSettings,
+  PIXEL_BOOST_OPTIONS,
+  SWAPPER_MODEL_INFO,
+  VideoSettings,
+} from "./Chips";
+import { t, useLang } from "./i18n";
 
-export const DEFAULT_NEGATIVE =
-  "artifacts, gpt-image, washed-out colors, low quality, low resolution, AI slop, deviantart, sloppy lines, rough sketch, blurry, indistinct, missing fingers, badly drawn hands, wrong number of fingers";
+interface Props {
+  mode: Mode;
+  img: ImageSettings;
+  onImg: (s: ImageSettings) => void;
+  vid: VideoSettings;
+  onVid: (s: VideoSettings) => void;
+  fswap: FaceSwapSettings;
+  onFswap: (s: FaceSwapSettings) => void;
+  presets: Record<string, Record<string, unknown>>;
+  onSavePreset: (name: string) => void;
+  onDeletePreset: (name: string) => void;
+  onApplyPreset: (params: Record<string, unknown>) => void;
+  onClose: () => void;
+}
 
-export const DEFAULT_PARAMS: ImageParams = {
-  ratio: "2:3",
-  size: "1.5K",
-  count: 1,
-  steps: 25,
-  cfg: 3,
-  turbo: false,
-  sampler: "euler",
-  scheduler: "simple",
-  seed: null,
-  negative: DEFAULT_NEGATIVE,
-  edit_resolution: "1080p",
-};
-
-const SAMPLERS: [string, string][] = [
-  ["euler", t("Euler: Noct-Q için önerilen, dengeli ve öngörülebilir")],
-  ["euler_ancestral", t("Euler A: her adımda biraz gürültü ekler; daha canlı ama her seferinde biraz farklı")],
-  ["res_multistep", t("RES multistep: az adımda keskin sonuç; 15-20 adımda iyi")],
-  ["dpmpp_2m", t("DPM++ 2M: ayrıntılı ve temiz; çoğu modelde güvenli seçim")],
-  ["dpmpp_2m_sde", t("DPM++ 2M SDE: daha dokulu, gerçekçi fotoğraflarda iyi; biraz yavaş")],
-  ["er_sde", t("ER SDE: yumuşak geçişler, portrelerde iyi")],
-  ["uni_pc", t("UniPC: çok az adımda (10-15) hızlı önizleme için")],
+const SAMPLER_INFO: { id: string; label: string; note: string }[] = [
+  { id: "euler", label: "Euler", note: "推荐默认，稳定且可预测" },
+  { id: "euler_ancestral", label: "Euler A", note: "每步注入少量噪声，细节更生动" },
+  { id: "res_multistep", label: "RES multistep", note: "Z-Image-Turbo 推荐，低步数锐度高" },
+  { id: "dpmpp_2m", label: "DPM++ 2M", note: "细节扎实干净，通用性好" },
+  { id: "dpmpp_2m_sde", label: "DPM++ 2M SDE", note: "纹理丰富，适合写实人像" },
+  { id: "er_sde", label: "ER SDE", note: "过渡柔和，适合特写肖像" },
+  { id: "uni_pc", label: "UniPC", note: "适合 10-15 步快速预览" },
 ];
 
-// Hız / kalite düğmeleri: CFG, adım, sampler ve turbo LoRA'yı birlikte ayarlar.
-const SPEED_PRESETS: [string, Pick<ImageParams, "cfg" | "steps" | "sampler" | "turbo">][] = [
-  ["Turbo", { cfg: 1, steps: 8, sampler: "euler", turbo: true }],
-  ["Hızlı", { cfg: 1, steps: 25, sampler: "euler", turbo: false }],
-  ["Kaliteli", { cfg: 3, steps: 25, sampler: "euler", turbo: false }],
-  ["Taslak", { cfg: 1, steps: 12, sampler: "uni_pc", turbo: false }],
+const SCHEDULER_INFO: { id: string; label: string; note: string }[] = [
+  { id: "simple", label: "Simple", note: "推荐默认" },
+  { id: "beta", label: "Beta", note: "首尾步数更密集，可增强细节" },
+  { id: "normal", label: "Normal", note: "均匀步长分布" },
+  { id: "karras", label: "Karras", note: "尾段精细采样" },
+  { id: "sgm_uniform", label: "SGM uniform", note: "Flow 模型常用均匀调度" },
 ];
 
-const SCHEDULERS: [string, string][] = [
-  ["simple", t("Simple: Qwen-Image için önerilen")],
-  ["beta", t("Beta: başta ve sonda daha çok adım; ayrıntıyı artırabilir")],
-  ["normal", t("Normal: eşit aralıklı")],
-  ["karras", t("Karras: son adımlarda ince ayrıntı; SD tarzı modellerde yaygın")],
-  ["sgm_uniform", t("SGM uniform: düzgün dağılım, bazı flow modellerinde iyi")],
+const IMAGE_PRESETS: { name: string; apply: Partial<ImageSettings> }[] = [
+  { name: "Turbo", apply: { turbo: true, steps: 8, cfg: 1.0, sampler: "euler", scheduler: "simple" } },
+  { name: "快速", apply: { turbo: false, steps: 20, cfg: 1.0, sampler: "euler", scheduler: "simple" } },
+  { name: "精细", apply: { turbo: false, steps: 28, cfg: 3.0, sampler: "euler", scheduler: "simple" } },
+  { name: "草稿", apply: { turbo: false, steps: 12, cfg: 1.0, sampler: "uni_pc", scheduler: "simple" } },
 ];
 
-function Field({ label, value, help, children }: { label: string; value?: ReactNode; help: ReactNode; children: ReactNode }) {
+function Field({ label, help, children }: { label: ReactNode; help?: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
   return (
     <div className="field">
-      <label>
-        <span className="label-text">
-          {label}
-          <span className="info" tabIndex={0} aria-label={t("{label} hakkında bilgi", { label })}>
-            <Info size={13} />
-            <span className="tip" role="tooltip">{help}</span>
-          </span>
-        </span>
-        {value !== undefined && <span className="field-value">{value}</span>}
-      </label>
+      <div className="field-head">
+        <span>{label}</span>
+        {help && (
+          <button
+            type="button"
+            className={`help-btn ${open ? "active" : ""}`}
+            onClick={() => setOpen((v) => !v)}
+            aria-label={t("查看说明")}
+          >
+            <HelpCircle size={12} />
+          </button>
+        )}
+      </div>
+      {open && help && <p className="field-help">{help}</p>}
       {children}
     </div>
   );
 }
 
-// models.toml'daki model adı ve açıklaması (/api/models); istek bir kez yapılır.
-let modelsRequest: Promise<Record<string, ModelInfo>> | null = null;
-
-function ModelField({ mode }: { mode: string }) {
-  const [info, setInfo] = useState<ModelInfo | null>(null);
-  useEffect(() => {
-    (modelsRequest ??= api.models()).then((m) => setInfo(m[mode] ?? null)).catch(() => {
-      modelsRequest = null;
-    });
-  }, [mode]);
-  if (!info) return null;
-  const d = info.description;
+function SeedField({
+  value,
+  onChange,
+  help,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  help: string;
+}) {
+  const roll = () => onChange(String(Math.floor(1 + Math.random() * 4294967294)));
   return (
-    <Field label={t("Model")} help={d[lang] ?? d.en ?? Object.values(d)[0] ?? ""}>
-      <div>{info.label}</div>
-    </Field>
-  );
-}
-
-// Sunucu seed'i 0 ile 2^32-1 arasında kabul eder; dışındakiler bu aralığa sıkıştırılır.
-const SEED_MAX = 2 ** 32 - 1;
-
-function SeedField({ seed, onChange, help }: { seed: number | null; onChange: (s: number | null) => void; help: string }) {
-  return (
-    <Field label={t("Seed")} help={help}>
-      <div className="row">
+    <Field label="Seed" help={help}>
+      <div className="seed-row">
         <input
-          type="number"
-          min={0}
-          max={SEED_MAX}
-          step={1}
-          placeholder={t("rastgele")}
-          value={seed ?? ""}
-          onChange={(e) => onChange(e.target.value === "" ? null : Math.min(SEED_MAX, Math.max(0, Math.floor(Number(e.target.value)))))}
+          type="text"
+          inputMode="numeric"
+          placeholder={t("随机")}
+          value={value}
+          onChange={(e) => onChange(e.target.value.replace(/\D/g, ""))}
         />
-        <button className="icon-btn" title={t("Rastgele")} aria-label={t("Rastgele seed")} onClick={() => onChange(null)}><Dices size={16} /></button>
+        <button type="button" className="btn-ghost" onClick={roll} title={t("随机生成 Seed")}>
+          <Shuffle size={12} /> {t("随机")}
+        </button>
+        {value && (
+          <button type="button" className="btn-ghost" onClick={() => onChange("")}>
+            ×
+          </button>
+        )}
       </div>
     </Field>
   );
 }
 
-interface Props {
-  mode: Mode;
-  params: ImageParams;
-  setParams: (p: ImageParams) => void;
-  videoParams: VideoParams;
-  setVideoParams: (p: VideoParams) => void;
-  musicParams: MusicParams;
-  setMusicParams: (p: MusicParams) => void;
-  speechParams: SpeechParams;
-  setSpeechParams: (p: SpeechParams) => void;
-  model3dParams: Model3DParams;
-  setModel3DParams: (p: Model3DParams) => void;
-  presets: Preset[];
-  editing: boolean;
-  onSavePreset: (name: string) => void;
-  onDeletePreset: (id: string) => void;
-  onClose: () => void;
-}
+export default function Settings({
+  mode,
+  img,
+  onImg,
+  vid,
+  onVid,
+  fswap,
+  onFswap,
+  presets,
+  onSavePreset,
+  onDeletePreset,
+  onApplyPreset,
+  onClose,
+}: Props) {
+  useLang();
+  const [presetName, setPresetName] = useState("");
+  const title =
+    mode === "image" ? "图片参数设置" : mode === "video" ? "视频参数设置" : "换脸流水线设置";
 
-const TITLES: Record<Mode, string> = {
-  image: t("Görsel ayarları"), video: t("Video ayarları"), model3d: t("3D model ayarları"), music: t("Müzik ayarları"), speech: t("Seslendirme ayarları"), transcribe: t("Yazıya dökme"),
-};
+  const reset = () => {
+    if (mode === "image") onImg(DEFAULT_IMAGE);
+    else if (mode === "video") onVid(DEFAULT_VIDEO);
+    else onFswap(DEFAULT_FACESWAP);
+  };
 
-export function Settings(props: Props) {
   return (
     <aside className="settings">
-      <h3>{TITLES[props.mode]} <button className="icon-btn" onClick={props.onClose} aria-label={t("Kapat")}><X size={16} /></button></h3>
-      {props.mode === "image" && <ImageSettings {...props} />}
-      {props.mode === "video" && <VideoSettings params={props.videoParams} setParams={props.setVideoParams} />}
-      {props.mode === "model3d" && <Model3DSettings params={props.model3dParams} setParams={props.setModel3DParams} />}
-      {props.mode === "music" && <MusicSettings params={props.musicParams} setParams={props.setMusicParams} />}
-      {props.mode === "speech" && <SpeechSettings params={props.speechParams} setParams={props.setSpeechParams} />}
-      {props.mode === "transcribe" && <TranscribeSettings />}
+      <div className="settings-head">
+        <span>{t(title)}</span>
+        <button className="icon-btn" onClick={onClose} aria-label={t("关闭")}>
+          <X size={15} />
+        </button>
+      </div>
+
+      {mode === "image" && (
+        <div className="settings-body">
+          <Field
+            label={t("工作流")}
+            help={t(
+              "Krea2-Noct / Noct-Q V4 支持文生图与多参考图编辑；Z-Image-Turbo NSFW 为 8 步 CFG=1.0 极速文生图工作流。"
+            )}
+          >
+            <select
+              value={img.profile}
+              onChange={(e) => {
+                const prof = e.target.value as ImageProfile;
+                if (prof === "z_image_turbo_nsfw") {
+                  onImg({
+                    ...img,
+                    profile: prof,
+                    steps: 8,
+                    cfg: 1.0,
+                    sampler: "res_multistep",
+                    scheduler: "simple",
+                    turbo: false,
+                  });
+                } else {
+                  onImg({ ...img, profile: prof, steps: 25, cfg: 3.0, sampler: "euler", scheduler: "simple" });
+                }
+              }}
+            >
+              <option value="krea2_noct">Krea2-Noct / Noct-Q V4（全能文生图+修图）</option>
+              <option value="z_image_turbo_nsfw">Z-Image-Turbo NSFW（8步极速生图）</option>
+            </select>
+          </Field>
+
+          {img.profile === "krea2_noct" && (
+            <Field
+              label={t("速度 / 画质档位")}
+              help={t("Turbo 使用 8 步加速 LoRA（约快 5 倍）；快速模式 CFG=1；精细模式 CFG=3 并启用负面提示词。")}
+            >
+              <div className="preset-row">
+                {IMAGE_PRESETS.map((p) => {
+                  const active =
+                    Boolean(img.turbo) === Boolean(p.apply.turbo) &&
+                    img.steps === p.apply.steps &&
+                    img.cfg === p.apply.cfg &&
+                    img.sampler === p.apply.sampler;
+                  return (
+                    <button
+                      key={p.name}
+                      type="button"
+                      className={`preset-btn ${active ? "active" : ""}`}
+                      onClick={() => onImg({ ...img, ...p.apply })}
+                    >
+                      {p.name === "Turbo" && <Zap size={11} />} {t(p.name)}
+                    </button>
+                  );
+                })}
+              </div>
+            </Field>
+          )}
+
+          <Field label={t("分辨率")}>
+            <select value={img.size} onChange={(e) => onImg({ ...img, size: e.target.value })}>
+              {Object.entries(IMAGE_SIZE_INFO).map(([k, v]) => (
+                <option key={k} value={k}>
+                  {v.label} · {v.mpx} ({t(v.secPerStep)})
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          <Field label={t("编辑分辨率")}>
+            <select
+              value={img.edit_resolution}
+              onChange={(e) => onImg({ ...img, edit_resolution: Number(e.target.value) })}
+            >
+              {Object.entries(EDIT_RES_INFO).map(([k, v]) => (
+                <option key={k} value={k}>
+                  {v.label} ({t(v.secPerStep)})
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          <Field
+            label={
+              <>
+                {t("步数")} <b>{img.steps}</b>
+              </>
+            }
+          >
+            <input
+              type="range"
+              min={4}
+              max={50}
+              value={img.steps}
+              onChange={(e) => onImg({ ...img, steps: Number(e.target.value) })}
+            />
+          </Field>
+
+          <Field
+            label={
+              <>
+                CFG <b>{img.cfg.toFixed(1)}</b>
+              </>
+            }
+          >
+            <input
+              type="range"
+              min={1}
+              max={7}
+              step={0.5}
+              value={img.cfg}
+              onChange={(e) => onImg({ ...img, cfg: Number(e.target.value) })}
+            />
+          </Field>
+
+          <Field label="Sampler">
+            <select value={img.sampler} onChange={(e) => onImg({ ...img, sampler: e.target.value })}>
+              {SAMPLER_INFO.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label} — {t(s.note)}
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          <Field label="Scheduler">
+            <select value={img.scheduler} onChange={(e) => onImg({ ...img, scheduler: e.target.value })}>
+              {SCHEDULER_INFO.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label} — {t(s.note)}
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          <SeedField
+            value={img.seed}
+            onChange={(seed) => onImg({ ...img, seed })}
+            help={t("固定相同的 Seed 与参数可复现画面，便于微调提示词。")}
+          />
+
+          <Field
+            label={
+              <>
+                {t("负面提示词")} {img.cfg <= 1 && <em className="muted">({t("CFG 1 时不生效")})</em>}
+              </>
+            }
+          >
+            <textarea
+              rows={2}
+              value={img.negative}
+              disabled={img.cfg <= 1}
+              placeholder="blurry, low quality, watermark, deformed"
+              onChange={(e) => onImg({ ...img, negative: e.target.value })}
+            />
+          </Field>
+        </div>
+      )}
+
+      {mode === "video" && (
+        <div className="settings-body">
+          <Field
+            label={t("工作流")}
+            help={t(
+              "MiniMax-H3 支持音视频同步生成与首尾帧控制；Wan2.2-Remix A14B 采用高低噪双阶段 FP8 模型接力采样。"
+            )}
+          >
+            <select
+              value={vid.profile}
+              onChange={(e) => onVid({ ...vid, profile: e.target.value as VideoProfile })}
+            >
+              <option value="minimax_h3">MiniMax-H3（音画同步 · 首尾帧）</option>
+              <option value="wan22_remix">Wan2.2-Remix A14B（双阶段 FP8 图生视频/文生视频）</option>
+            </select>
+          </Field>
+
+          <Field label={t("模式")}>
+            <div className="preset-row">
+              {(["turbo", "quality"] as const).map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  className={`preset-btn ${vid.quality === q ? "active" : ""}`}
+                  onClick={() => onVid({ ...vid, quality: q })}
+                >
+                  {q === "turbo" ? (
+                    <>
+                      <Zap size={11} /> {t("Turbo (8 步)")}
+                    </>
+                  ) : (
+                    t("精细 (20 步)")
+                  )}
+                </button>
+              ))}
+            </div>
+          </Field>
+
+          <Field label={t("分辨率")}>
+            <select value={vid.resolution} onChange={(e) => onVid({ ...vid, resolution: e.target.value })}>
+              <option value="480p">480p (~3.5m Turbo / ~9m {t("精细")})</option>
+              <option value="768p">768p (~9m Turbo / ~22m {t("精细")})</option>
+            </select>
+          </Field>
+
+          <Field
+            label={
+              <>
+                {t("时长")} <b>{vid.seconds}s</b>
+              </>
+            }
+          >
+            <input
+              type="range"
+              min={2}
+              max={10}
+              value={vid.seconds}
+              onChange={(e) => onVid({ ...vid, seconds: Number(e.target.value) })}
+            />
+          </Field>
+
+          <SeedField
+            value={vid.seed}
+            onChange={(seed) => onVid({ ...vid, seed })}
+            help={t("固定 Seed 可在相同参数下复现镜头轨迹。")}
+          />
+        </div>
+      )}
+
+      {mode === "faceswap" && (
+        <div className="settings-body">
+          <Field
+            label={t("换脸引擎")}
+            help={t(
+              "阶段一主力使用远端 FaceFusion CLI 全自动无头流水线（已内置 NSFW 拦截短路与哈希校验绕过双补丁）；阶段二实验提供 DreamID-V Faster 外层 81 帧自动切片与拼接流水线。"
+            )}
+          >
+            <select
+              value={fswap.engine}
+              onChange={(e) => onFswap({ ...fswap, engine: e.target.value as FaceSwapEngine })}
+            >
+              <option value="facefusion_cli">FaceFusion CLI（远端全自动批处理主力）</option>
+              <option value="dreamid_v_faster">DreamID-V Faster（81帧自动切片扩散换脸）</option>
+            </select>
+          </Field>
+
+          {fswap.engine === "facefusion_cli" && (
+            <>
+              <Field
+                label={t("同管道三底模基准对比")}
+                help={t(
+                  "开启后，单次任务会在同一管道内依次运行 hyperswap_1a_256、alphaface_256 与 inswapper_128_fp16 三个底模并排输出，直观对比侧脸保持度、肤色融合与耗时。"
+                )}
+              >
+                <div className="preset-row">
+                  <button
+                    type="button"
+                    className={`preset-btn ${!fswap.compare_all ? "active" : ""}`}
+                    onClick={() => onFswap({ ...fswap, compare_all: false })}
+                  >
+                    {t("单底模运行")}
+                  </button>
+                  <button
+                    type="button"
+                    className={`preset-btn ${fswap.compare_all ? "active" : ""}`}
+                    onClick={() => onFswap({ ...fswap, compare_all: true })}
+                  >
+                    {t("三底模同管道对比")}
+                  </button>
+                </div>
+              </Field>
+
+              {!fswap.compare_all && (
+                <Field
+                  label={t("换脸底模")}
+                  help={t(
+                    "HyperSwap 1A 256 为原生 256×256 主力底模，光影与肤色过渡更自然；AlphaFace 256 针对大侧脸优化；InSwapper 128 FP16 为经典速度基线。"
+                  )}
+                >
+                  <select
+                    value={fswap.swapper_model}
+                    onChange={(e) => onFswap({ ...fswap, swapper_model: e.target.value as SwapperModel })}
+                  >
+                    {SWAPPER_MODEL_INFO.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label} — {t(m.note)}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              )}
+
+              <Field
+                label={t("超分像素倍率 (Pixel Boost)")}
+                help={t("将人脸区域拆分为子块推理后再拼接回原图，512x512 及以上在大特写镜头下细节更清晰。")}
+              >
+                <select
+                  value={fswap.pixel_boost}
+                  onChange={(e) => onFswap({ ...fswap, pixel_boost: e.target.value as PixelBoost })}
+                >
+                  {PIXEL_BOOST_OPTIONS.map((b) => (
+                    <option key={b} value={b}>
+                      {b}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+
+              <Field
+                label={t("画质增强后处理 (Face Enhancer)")}
+                help={t(
+                  "基准测试建议先选「关闭增强」观察底模真实表现；目标视频压缩模糊时可按需开启 CodeFormer 或 GFPGAN 1.4。"
+                )}
+              >
+                <select
+                  value={fswap.enhancer_model}
+                  onChange={(e) => onFswap({ ...fswap, enhancer_model: e.target.value as EnhancerModel })}
+                >
+                  {ENHANCER_OPTIONS.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {t(opt.label)}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+
+              {fswap.enhancer_model !== "none" && (
+                <Field
+                  label={
+                    <>
+                      {t("增强混合比 (Blend)")} <b>{fswap.enhancer_blend}%</b>
+                    </>
+                  }
+                  help={t("推荐维持在 40%–60% 区间，避免 80%+ 导致的五官轻微变形与塑料假皮感。")}
+                >
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={5}
+                    value={fswap.enhancer_blend}
+                    onChange={(e) => onFswap({ ...fswap, enhancer_blend: Number(e.target.value) })}
+                  />
+                </Field>
+              )}
+            </>
+          )}
+
+          <p className="settings-note">
+            {t(
+              "精修升级边界：若遇到手部挡脸、刘海遮挡、眼镜边框等复杂镜头，点击结果卡片上的下载按钮，在本地桌面使用 VisoMaster-Fusion 手工画 XSeg 遮罩精修。"
+            )}
+          </p>
+        </div>
+      )}
+
+      <div className="presets-box">
+        <div className="field-head">
+          <span>
+            <Bookmark size={11} style={{ verticalAlign: "-1px" }} /> {t("预设列表")}
+          </span>
+        </div>
+        {Object.keys(presets).length > 0 && (
+          <div className="saved-presets">
+            {Object.entries(presets).map(([name, params]) => (
+              <div key={name} className="saved-preset">
+                <button
+                  type="button"
+                  className="saved-preset-name"
+                  onClick={() => onApplyPreset(params)}
+                  title={t("应用")}
+                >
+                  {name}
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={() => onDeletePreset(name)}
+                  title={t("删除")}
+                  aria-label={t("删除")}
+                >
+                  <Trash2 size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <form
+          className="seed-row"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const n = presetName.trim();
+            if (!n) return;
+            onSavePreset(n);
+            setPresetName("");
+          }}
+        >
+          <input
+            type="text"
+            placeholder={t("预设名称")}
+            maxLength={40}
+            value={presetName}
+            onChange={(e) => setPresetName(e.target.value)}
+          />
+          <button type="submit" className="btn-ghost" disabled={!presetName.trim()}>
+            {t("保存")}
+          </button>
+        </form>
+      </div>
+
+      <button type="button" className="btn-ghost settings-reset" onClick={reset}>
+        <RotateCcw size={12} /> {t("恢复默认参数")}
+      </button>
     </aside>
   );
-}
-
-function ImageSettings({ params, setParams, presets, editing, onSavePreset, onDeletePreset }: Props) {
-  const [presetName, setPresetName] = useState("");
-  const set = (patch: Partial<ImageParams>) => setParams({ ...params, ...patch });
-  const samplerHelp = SAMPLERS.find(([k]) => k === params.sampler)?.[1];
-  const schedulerHelp = SCHEDULERS.find(([k]) => k === params.scheduler)?.[1];
-
-  return (
-    <>
-      <ModelField mode="image" />
-      <Field label={t("Hız / kalite")} help={t("Turbo: 8 adımlık LoRA ile ~5 kat hızlı (1.5K ≈ 12 sn). Hızlı: CFG 1, negatif istem yok sayılır, yaklaşık 2 kat hızlı (~30 sn). Kaliteli: CFG 3, negatif istem devrede (~1 dk). Taslak: 12 adım UniPC, hızlı önizleme.")}>
-        <div className="row">
-          {SPEED_PRESETS.map(([name, p]) => (
-            <button
-              key={name}
-              className={`chip ${params.cfg === p.cfg && params.steps === p.steps && params.sampler === p.sampler && Boolean(params.turbo) === Boolean(p.turbo) ? "on" : ""}`}
-              onClick={() => set(p)}
-            >
-              {t(name)}
-            </button>
-          ))}
-        </div>
-      </Field>
-      {!editing && (
-        <Field
-          label={t("Çözünürlük")}
-          value={params.size}
-          help={t("Toplam piksel; oran sohbet kutusundaki oran seçiminden gelir. Süre (CFG 3; Hızlı modda yarısı): {list}. 25 adımlık 1.5K ≈ 1 dk.", { list: IMAGE_SIZES.map(([k, mp, x, sec]) => `${k} (${mp}) ${x}, ${sec}`).join(" · ") })}
-        >
-          <div className="row">
-            {IMAGE_SIZES.map(([k, , x, sec]) => (
-              <button key={k} className={`chip ${params.size === k ? "on" : ""}`} onClick={() => set({ size: k })} title={t("{x} süre, {sec}", { x, sec })}>
-                {k}
-              </button>
-            ))}
-          </div>
-        </Field>
-      )}
-      {editing && (
-        <Field
-          label={t("Düzenleme çözünürlüğü")}
-          value={params.edit_resolution}
-          help={t("Eklediğin görsel ve sonuç bu boyuta küçültülür, oran görselden gelir. Referans da işlendiği için düzenleme aynı boyuttaki üretimden ağırdır. Süre (CFG 3; Hızlı modda yarısı): {list}. 25 adımlık 1080p ≈ 3.5 dk.", { list: EDIT_RESOLUTIONS.map(([r, x, sec]) => `${r} ${x}, ${sec}`).join(" · ") })}
-        >
-          <div className="row">
-            {EDIT_RESOLUTIONS.map(([r, x, sec]) => (
-              <button key={r} className={`chip ${params.edit_resolution === r ? "on" : ""}`} onClick={() => set({ edit_resolution: r })} title={t("{x} süre, {sec}", { x, sec })}>
-                {r}
-              </button>
-            ))}
-          </div>
-        </Field>
-      )}
-      {/* Turbo LoRA 8 adım / CFG 1 için damıtıldı; elle değiştirilince kapanır (yoksa hiçbir hız düğmesi seçili görünmeden açık kalırdı). */}
-      <Field label={t("Adım")} value={params.steps} help={t("Gürültüden görsele kaç adımda gidileceği. Fazlası daha ayrıntılı ama orantılı yavaş; 20-30 yeterli, 40 üstü nadiren fark eder.")}>
-        <input type="range" min={8} max={50} step={1} value={params.steps} onChange={(e) => set({ steps: Number(e.target.value), turbo: false })} />
-      </Field>
-      <Field label="CFG" value={params.cfg.toFixed(1)} help={t("İsteme ne kadar sıkı uyulacağı. 1: negatif istem kapalı ve 2 kat hızlı. 2.5-4: dengeli. Çok yüksek değerler yanık, aşırı doygun renk verir.")}>
-        <input type="range" min={1} max={8} step={0.5} value={params.cfg} onChange={(e) => set({ cfg: Number(e.target.value), turbo: false })} />
-      </Field>
-      <Field label="Sampler" help={samplerHelp}>
-        <select value={params.sampler} onChange={(e) => set({ sampler: e.target.value })}>
-          {SAMPLERS.map(([k]) => <option key={k} value={k}>{k}</option>)}
-        </select>
-      </Field>
-      <Field label="Scheduler" help={schedulerHelp}>
-        <select value={params.scheduler} onChange={(e) => set({ scheduler: e.target.value })}>
-          {SCHEDULERS.map(([k]) => <option key={k} value={k}>{k}</option>)}
-        </select>
-      </Field>
-      <SeedField
-        seed={params.seed}
-        onChange={(seed) => set({ seed })}
-        help={t("Aynı seed + aynı ayarlar = aynı görsel. Beğendiğin bir sonucun seed'ini sabitleyip yalnızca istemi değiştirerek kontrollü varyasyon alırsın. Birden çok adet üretilirse seed her görselde 1 artar.")}
-      />
-      <Field label={t("Negatif istem")} value={params.cfg === 1 ? t("CFG 1'de etkisiz") : undefined} help={t("Görselde istemediklerin (İngilizce daha etkili). Yalnızca CFG 1'den büyükken çalışır.")}>
-        <AutoTextarea value={params.negative} onChange={(v) => set({ negative: v })} />
-        <button className="btn ghost" style={{ alignSelf: "flex-start" }} onClick={() => set({ negative: DEFAULT_NEGATIVE })}>{t("Varsayılana dön")}</button>
-      </Field>
-      <Field label={t("Ön ayarlar")} help={t("Bu paneldeki tüm ayarları adıyla kaydeder; sohbet kutusundaki 'Ön ayar' menüsünden tek tıkla uygularsın.")}>
-        {presets.map((p) => (
-          <div key={p.id} className="preset">
-            <button onClick={() => setParams({ ...DEFAULT_PARAMS, ...p.params })} title={t("Uygula")}>{p.name}</button>
-            <button className="icon-btn" aria-label={t("Sil")} onClick={() => onDeletePreset(p.id)}><Trash2 size={14} /></button>
-          </div>
-        ))}
-        <div className="row">
-          <input type="text" placeholder={t("Ön ayar adı")} value={presetName} onChange={(e) => setPresetName(e.target.value)} />
-          <button
-            className="icon-btn"
-            aria-label={t("Kaydet")}
-            title={t("Mevcut ayarları kaydet")}
-            disabled={!presetName.trim()}
-            onClick={() => {
-              onSavePreset(presetName.trim());
-              setPresetName("");
-            }}
-          >
-            <Save size={16} />
-          </button>
-        </div>
-      </Field>
-      <button className="btn ghost" onClick={() => setParams({ ...DEFAULT_PARAMS })}>{t("Tüm ayarları sıfırla")}</button>
-    </>
-  );
-}
-
-function VideoSettings({ params, setParams }: { params: VideoParams; setParams: (p: VideoParams) => void }) {
-  const set = (patch: Partial<VideoParams>) => setParams({ ...params, ...patch });
-  return (
-    <>
-      <ModelField mode="video" />
-      <Field label={t("Mod")} help={t("Turbo: 8 adımlık LoRA ile ~2.5 kat hızlı, çoğu sahne için yeterli. Kaliteli: 20 adım, hareket ve ayrıntı daha tutarlı ama uzun sürer.")}>
-        <div className="row">
-          <button className={`chip ${params.turbo ? "on" : ""}`} onClick={() => set({ turbo: true })}>{t("Turbo (8 adım)")}</button>
-          <button className={`chip ${!params.turbo ? "on" : ""}`} onClick={() => set({ turbo: false })}>{t("Kaliteli (20 adım)")}</button>
-        </div>
-      </Field>
-      <Field label={t("Çözünürlük")} help={t("480p L4'te hızlıdır (~3.5 dk). 768p modelin doğal çözünürlüğü; 10 sn 768p Turbo'da ~15 dk sürer; Kaliteli (20 adım) modda 8 sn ~25 dk, daha uzunu 30 dk sınırını aşar.")}>
-        <div className="row">
-          {["480p", "768p"].map((q) => (
-            <button key={q} className={`chip ${params.quality === q ? "on" : ""}`} onClick={() => set({ quality: q })}>{q}</button>
-          ))}
-        </div>
-      </Field>
-      <Field label={t("Süre")} value={t("{n} sn", { n: params.seconds })} help={t("Model 17 karelik bloklarla çalışır; süre en yakın geçerli uzunluğa yuvarlanır. Uzun video süreyi doğrusal artırır; 5 sn eğitimdeki tipik uzunluk.")}>
-        <input type="range" {...VIDEO_SECONDS_RANGE} value={params.seconds} onChange={(e) => set({ seconds: Number(e.target.value) })} />
-      </Field>
-      <SeedField seed={params.seed} onChange={(seed) => set({ seed })} help={t("Aynı seed ve ayarlarla aynı video çıkar. Beğendiğin bir sahneyi sabitleyip istemi ince ayarlamak için kullan.")} />
-      <div className="help">
-        {t('İpucu: İstemde sahneyi, kamera hareketini ve sesi ayrı ayrı anlat. Zaman çizelgesi yazabilirsin, örneğin "[0s-2s] yakın çekim… [2s-5s] kamera geri çekilir…". Bir görsel eklersen ilk kare, ikinci görsel son kare olur.')}
-      </div>
-    </>
-  );
-}
-
-function Model3DSettings({ params, setParams }: { params: Model3DParams; setParams: (p: Model3DParams) => void }) {
-  const set = (patch: Partial<Model3DParams>) => setParams({ ...params, ...patch });
-  const textureHelp = MODEL3D_TEXTURES.map(([, label, help]) => `${label}: ${help}`).join(" ");
-  return (
-    <>
-      <ModelField mode="model3d" />
-      <Field
-        label={t("Şekil çözünürlüğü")}
-        value={params.resolution}
-        help={t("Şeklin oluşturulduğu voksel ızgarası. Yükseldikçe ince ayrıntılar (yazı, kenar, kabartma) netleşir ama süre ve bellek artar. Toplam süre (PBR doku ile): {list}. GPU açıldıktan sonraki ilk 3D işi modelleri yüklediği için ~30 sn daha uzun sürer (1024'te ölçüm: 194.3 sn soğuk, 162.2 sn sıcak).", { list: MODEL3D_RESOLUTIONS.map(([r, d]) => `${r} ${d}`).join(" · ") })}
-      >
-        <div className="row">
-          {MODEL3D_RESOLUTIONS.map(([r, d]) => (
-            <button key={r} className={`chip ${params.resolution === r ? "on" : ""}`} onClick={() => set({ resolution: r })} title={d}>{r}</button>
-          ))}
-        </div>
-      </Field>
-      <Field label={t("Doku")} help={textureHelp}>
-        <div className="row">
-          {MODEL3D_TEXTURES.map(([k, label]) => (
-            <button key={k} className={`chip ${params.texture === k ? "on" : ""}`} onClick={() => set({ texture: k })}>{label}</button>
-          ))}
-        </div>
-      </Field>
-      <Field label={t("Üçgen sayısı")} value={facesLabel(params.faces)} help={t("Ağ bu sayıya sadeleştirilir. 50K: web ve oyun için hafif. 200K: dengeli. 500K-1M: baskı ve yakın çekim için ayrıntılı ama dosya büyür, görüntüleyici yavaşlar.")}>
-        <div className="row">
-          {MODEL3D_FACES.map((n) => (
-            <button key={n} className={`chip ${params.faces === n ? "on" : ""}`} onClick={() => set({ faces: n })}>{facesLabel(n)}</button>
-          ))}
-        </div>
-      </Field>
-      <SeedField seed={params.seed} onChange={(seed) => set({ seed })} help={t("Aynı görsel, seed ve ayarlarla aynı model çıkar. Görünmeyen yüzler (arka taraf) seed'e göre farklı tahmin edilir; beğenmezsen yeni seed dene.")} />
-      <div className="help">
-        {t("İpucu: Nesnenin tamamı görünsün, kesilmesin; düz ya da sade arka plan ve yumuşak ışık en iyisi. Görsel modunda ürettiğin bir görselin üstündeki küp düğmesiyle onu doğrudan buraya gönderebilirsin.")}
-      </div>
-    </>
-  );
-}
-
-function MusicSettings({ params, setParams }: { params: MusicParams; setParams: (p: MusicParams) => void }) {
-  const set = (patch: Partial<MusicParams>) => setParams({ ...params, ...patch });
-  return (
-    <>
-      <ModelField mode="music" />
-      <Field label={t("En uzun süre")} value={t("{n} sn", { n: params.seconds })} help={t("Üst sınırdır; model sözler bitince daha erken durabilir. Uzun şarkılar üretim süresini artırır.")}>
-        <input type="range" {...MUSIC_SECONDS_RANGE} value={params.seconds} onChange={(e) => set({ seconds: Number(e.target.value) })} />
-      </Field>
-      <SeedField seed={params.seed} onChange={(seed) => set({ seed })} help={t("Aynı seed ve ayarlarla aynı şarkı çıkar.")} />
-      <div className="help">
-        {t("İpucu: Tarz kutusuna dil, vokal türü, tür, tempo (BPM) ve enstrümanları yaz. Sözlerde [Verse], [Chorus], [Bridge] etiketleri yapıyı belirler. Sözleri boş bırakırsan enstrümantal olur.")}
-      </div>
-    </>
-  );
-}
-
-function SpeechSettings({ params, setParams }: { params: SpeechParams; setParams: (p: SpeechParams) => void }) {
-  const set = (patch: Partial<SpeechParams>) => setParams({ ...params, ...patch });
-  const chatterbox = params.engine === "chatterbox";
-  return (
-    <>
-      <Field
-        label={t("Motor")}
-        help={t("Chatterbox: 23 dil (Türkçe dahil), herhangi bir sesi birkaç saniyelik örnekten klonlar, duygu yoğunluğu ayarlanabilir. Qwen3-TTS: 10 dil (Türkçe yok), 9 hazır ses ve 'nasıl konuşsun' talimatı; klonlamada referans metni verilirse daha isabetli.")}
-      >
-        <div className="row">
-          <button className={`chip ${chatterbox ? "on" : ""}`} onClick={() => set({ engine: "chatterbox", language: "Turkish", temperature: 0.8 })}>Chatterbox</button>
-          <button className={`chip ${!chatterbox ? "on" : ""}`} onClick={() => set({ engine: "qwen3", language: "Auto", temperature: 0.9 })}>Qwen3-TTS</button>
-        </div>
-      </Field>
-      {chatterbox && (
-        <Field label={t("Duygu yoğunluğu")} value={params.exaggeration.toFixed(2)} help={t("0.5 doğal konuşma. Yükseldikçe daha coşkulu ve dramatik; 1'in üstü abartılı olabilir. Yüksek değerlerde konuşma da hızlanır, tempoyu dengelemek için CFG'yi düşür.")}>
-          <input type="range" min={0.25} max={2} step={0.05} value={params.exaggeration} onChange={(e) => set({ exaggeration: Number(e.target.value) })} />
-        </Field>
-      )}
-      {chatterbox && (
-        <Field label={t("CFG / tempo")} value={params.cfg_weight.toFixed(2)} help={t("Referans sese ve metne ne kadar sıkı uyulacağı. Düşük değer (0.3) daha yavaş, sakin ve akıcı konuşma verir; hızlı konuşan bir referans seste düşürmek iyi olur. 0 dil aksanını referanstan taşımaz.")}>
-          <input type="range" min={0} max={1} step={0.05} value={params.cfg_weight} onChange={(e) => set({ cfg_weight: Number(e.target.value) })} />
-        </Field>
-      )}
-      <Field label={t("Sıcaklık")} value={params.temperature.toFixed(2)} help={t("Çeşitlilik. Düşük: tutarlı ve düz; yüksek: daha canlı tonlama ama hata (yanlış vurgu, takılma) olasılığı artar. Chatterbox için 0.8, Qwen3 için 0.9 iyi başlangıç.")}>
-        <input type="range" min={0.05} max={1.5} step={0.05} value={params.temperature} onChange={(e) => set({ temperature: Number(e.target.value) })} />
-      </Field>
-      {!chatterbox && (
-        <Field label={t("Konuşma talimatı")} help={t("Hazır seslerde nasıl konuşacağını tarif et (İngilizce/Çince en iyi): 'Speak warmly and slowly', 'Excited, fast-paced sports commentary'. Klonlamada kullanılmaz.")}>
-          <AutoTextarea value={params.instruct} onChange={(v) => set({ instruct: v })} />
-        </Field>
-      )}
-      <Field label={t("Referans sesin metni")} help={t("Ses klonlarken eklediğin kayıtta tam olarak ne söylendiğini yazarsan Qwen3 sesi çok daha isabetli kopyalar. Boş bırakırsan yalnızca ses rengi kullanılır. Chatterbox metne ihtiyaç duymaz.")}>
-        <AutoTextarea value={params.reference_text} onChange={(v) => set({ reference_text: v })} />
-      </Field>
-      <SeedField seed={params.seed} onChange={(seed) => set({ seed })} help={t("Aynı seed ve ayarlarla aynı okuma çıkar. Beğenmediğin bir okumayı yeni seed ile tekrar dene.")} />
-      <div className="help">
-        {t("İpucu: Klonlama için 5-15 saniyelik, tek kişinin konuştuğu, müziksiz ve yankısız bir kayıt ekle. Uzun metinler otomatik olarak cümlelere bölünüp birleştirilir. Metinde [pause:1s] ile duraklama ekleyebilirsin.")}
-      </div>
-    </>
-  );
-}
-
-function TranscribeSettings() {
-  return (
-    <>
-      <Field label={t("Model")} help={t("OpenAI Whisper large-v3-turbo: large-v3 kalitesine yakın, ~8 kat hızlı. 99 dil; Türkçe'de iyi sonuç verir.")}>
-        <div>Whisper large-v3-turbo</div>
-      </Field>
-      <div className="help">
-        {t("Dil: Kaydın dilini biliyorsan seç; otomatik algılama kısa kayıtlarda yanılabilir. Uzun kayıtlar otomatik olarak 30 saniyelik parçalarla işlenir. Sonuç metni kopyalayabilir ya da .txt olarak indirebilirsin.")}
-      </div>
-    </>
-  );
-}
-
-// Yazının tamamı görünsün diye yüksekliği içeriğe göre ayarlanır.
-function AutoTextarea({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const ref = useRef<HTMLTextAreaElement>(null);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight + 2}px`;
-  }, [value]);
-  return <textarea ref={ref} className="autogrow" value={value} onChange={(e) => onChange(e.target.value)} />;
 }

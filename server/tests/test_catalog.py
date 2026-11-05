@@ -1,78 +1,48 @@
-"""Model kataloğu (models.toml): varsayılan dosya geçerli, hatalı dosya açık bir mesajla reddedilir."""
-import sys
-import tomllib
-from pathlib import Path
+"""Tests for `station/catalog.py` and `station/models.default.toml`."""
+from __future__ import annotations
 
+import copy
+import tomllib
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(ROOT / "station"))
-import catalog  # noqa: E402
-
-DEFAULT = ROOT / "station" / "models.default.toml"
+from station import catalog
 
 
-def _data():
-    return tomllib.loads(DEFAULT.read_text())
+def _raw_default() -> dict:
+    with open(catalog.DEFAULT_TOML, "rb") as f:
+        return tomllib.load(f)
 
 
-def test_default_catalog_fills_every_slot():
-    c = catalog.load(DEFAULT)
-    assert set(c) == set(catalog.SLOTS)
-    for mode, slots in catalog.SLOTS.items():
-        assert set(c[mode]["files"]) == set(slots)
-        assert c[mode]["label"] and c[mode]["description"]["en"] and c[mode]["description"]["tr"]
+def test_default_toml_validates():
+    loaded = catalog.load(catalog.DEFAULT_TOML)
+    assert set(loaded) == set(catalog.SLOTS)
+    for pack, slots in catalog.SLOTS.items():
+        assert set(loaded[pack]) == set(slots)
 
 
-def test_missing_slot_is_rejected():
-    data = _data()
-    del data["image"]["files"]["vae"]
-    with pytest.raises(catalog.CatalogError, match=r"\[image.files\] missing slot\(s\): vae"):
-        catalog.parse(data)
+def test_unknown_pack_rejected():
+    raw = _raw_default()
+    raw["unknown_pack"] = {}
+    with pytest.raises(ValueError, match="未知模型包"):
+        catalog.validate(raw)
 
 
-def test_unknown_slot_and_mode_are_rejected():
-    data = _data()
-    data["image"]["files"]["refiner"] = {"repo": "a/b", "file": "x.safetensors", "dir": "loras"}
-    with pytest.raises(catalog.CatalogError, match="unknown slot"):
-        catalog.parse(data)
-    data = _data()
-    data["upscale"] = {}
-    with pytest.raises(catalog.CatalogError, match="unknown mode"):
-        catalog.parse(data)
+def test_missing_slot_rejected():
+    raw = copy.deepcopy(_raw_default())
+    del raw["image"]["vae"]
+    with pytest.raises(ValueError, match=r"\[image\.vae\]"):
+        catalog.validate(raw)
 
 
-@pytest.mark.parametrize("entry, message", [
-    ({"repo": "a/b", "file": "x"}, "missing dir"),
-    ({"repo": "nope", "file": "x", "dir": "vae"}, "owner/name"),
-    ({"repo": "a/b", "file": "x", "dir": "../etc"}, "relative folder"),
-    ({"repo": "a/b", "file": "x", "dir": "/abs"}, "relative folder"),
-])
-def test_bad_entries_are_rejected(entry, message):
-    data = _data()
-    data["music"]["files"]["checkpoint"] = entry
-    with pytest.raises(catalog.CatalogError, match=message):
-        catalog.parse(data)
+def test_invalid_target_path_traversal_rejected():
+    raw = copy.deepcopy(_raw_default())
+    raw["image"]["vae"]["target"] = "../evil.safetensors"
+    with pytest.raises(ValueError, match="纯文件名"):
+        catalog.validate(raw)
 
 
-def test_replacing_a_model_changes_the_workflow_file(tmp_path):
-    text = DEFAULT.read_text().replace("NoctQ_V4_int8_convrot.safetensors", "diffusion_models/qwen_image_2.1_int8_convrot.safetensors")
-    path = tmp_path / "models.toml"
-    path.write_text(text)
-    c = catalog.load(path)
-    assert catalog.filename(c, "image", "diffusion_model") == "qwen_image_2.1_int8_convrot.safetensors"
-
-
-def test_toml_syntax_error_names_the_file(tmp_path):
-    path = tmp_path / "models.toml"
-    path.write_text("[image\n")
-    with pytest.raises(catalog.CatalogError, match=r"models\.toml"):
-        catalog.load(path)
-
-
-async def test_models_endpoint_lists_labels(client):
-    r = await client.get("/api/models")
-    assert r.status == 200
-    body = await r.json()
-    assert body["image"]["label"] == "Noct-Q V4"
-    assert body["video"]["description"]["tr"]
+def test_file_names_returns_targets():
+    names = catalog.file_names("image_turbo", catalog.DEFAULT_TOML)
+    assert names["diffusion"] == "z_image_turbo_bf16_nsfw_v2.safetensors"
+    assert names["encoder"] == "qwen_3_4b.safetensors"
+    assert names["vae"] == "zimage-ae.safetensors"

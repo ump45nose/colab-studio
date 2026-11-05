@@ -1,63 +1,144 @@
-import { Clock, Menu, Power, ScrollText, SlidersHorizontal } from "lucide-react";
-import type { RuntimeState } from "./api";
-import { LANGS, lang, setLang, t, tServer, type Lang } from "./i18n";
-
-const PHASES: Record<RuntimeState["phase"], string> = {
-  off: t("GPU kapalı"),
-  starting: t("GPU açılıyor"),
-  ready: t("hazır"),
-  stopping: t("Kapanıyor"),
-  error: t("Hata"),
-};
-
-function pillClass(phase: RuntimeState["phase"]) {
-  if (phase === "ready") return "ready";
-  if (phase === "error") return "error";
-  if (phase === "off") return "off";
-  return "busy";
-}
+import { Cpu, Menu, Power, ScrollText, SlidersHorizontal } from "lucide-react";
+import { RuntimeStatus, StartupEstimates, UsageInfo } from "./api";
+import { fmtDuration } from "./format";
+import { LANGS, t, useLang } from "./i18n";
+import { CreditPill, GpuStatsPill, ModelPackPill, StartupPill } from "./SystemPanel";
 
 interface Props {
-  rt: RuntimeState | null;
+  rt: RuntimeStatus;
+  usage: UsageInfo | null;
+  usageError?: string | null;
+  startupEstimates?: StartupEstimates;
   onStart: () => void;
   onStop: () => void;
-  onToggleAuto: () => void;
-  onToggleLog: () => void;
+  showLogs: boolean;
+  onToggleLogs: () => void;
+  showSettings: boolean;
   onToggleSettings: () => void;
-  onToggleMenu: () => void;
+  onToggleNav: () => void;
+  theme: "dark" | "dim" | "light";
+  onTheme: (t: "dark" | "dim" | "light") => void;
 }
 
-export function TopBar({ rt, onStart, onStop, onToggleAuto, onToggleLog, onToggleSettings, onToggleMenu }: Props) {
-  const running = rt && rt.phase !== "off" && rt.phase !== "error";
+const STATE_LABEL: Record<RuntimeStatus["state"], string> = {
+  off: "GPU 已关闭",
+  starting: "正在启动 GPU",
+  ready: "已就绪",
+  stopping: "正在关闭",
+  error: "错误",
+};
+
+const THEMES: { id: "dark" | "dim" | "light"; label: string }[] = [
+  { id: "dark", label: "深色" },
+  { id: "dim", label: "暗灰" },
+  { id: "light", label: "浅色" },
+];
+
+export default function TopBar({
+  rt,
+  usage,
+  usageError,
+  startupEstimates,
+  onStart,
+  onStop,
+  showLogs,
+  onToggleLogs,
+  showSettings,
+  onToggleSettings,
+  onToggleNav,
+  theme,
+  onTheme,
+}: Props) {
+  const [lang, setLang] = useLang();
+  const busy = rt.state === "starting" || rt.state === "stopping";
+  const idleLeftMin =
+    rt.state === "ready" && rt.active_jobs === 0 && rt.idle_timeout_s > 0
+      ? Math.max(1, Math.ceil((rt.idle_timeout_s - rt.idle_s) / 60))
+      : null;
+  const idleMaxMin = Math.round(rt.idle_timeout_s / 60);
+  const idleElapsedMin = Math.floor(rt.idle_s / 60);
+
   return (
-    <div className="topbar">
-      <button className="icon-btn menu-btn" onClick={onToggleMenu} aria-label={t("Menü")}>
-        <Menu size={18} />
-      </button>
-      {rt && (
-        <span className={`pill ${pillClass(rt.phase)}`} title={tServer(rt.detail)}>
-          {rt.phase === "ready" ? `${rt.gpu} ${PHASES.ready}` : PHASES[rt.phase]}
-        </span>
-      )}
-      {rt && (running ? (
-        <button className="btn danger" onClick={onStop}><Power size={14} /> {t("Kapat")}</button>
-      ) : (
-        <button className="btn" onClick={onStart}><Power size={14} /> {t("{gpu} başlat", { gpu: rt.gpu })}</button>
-      ))}
-      {rt?.idle_seconds !== null && rt?.idle_seconds !== undefined && rt.auto_shutdown && (
-        <span className="stat"><Clock size={14} /> {t("Boşta {n}/{max} dk", { n: Math.floor(rt.idle_seconds / 60), max: rt.idle_minutes })}</span>
-      )}
-      <span className="spacer" />
-      {rt && (
-        <button className={`switch ${rt.auto_shutdown ? "on" : ""}`} onClick={onToggleAuto} title={t("{n} dk boşta kalınca GPU'yu kapat", { n: rt.idle_minutes })}>
-          <span className="track" /> {t("Otomatik kapanma")}
+    <header className="topbar">
+      <div className="topbar-left">
+        <button className="icon-btn nav-toggle" onClick={onToggleNav} title={t("菜单")} aria-label={t("菜单")}>
+          <Menu size={16} />
         </button>
-      )}
-      <select className="chip lang" value={lang} onChange={(e) => setLang(e.target.value as Lang)} aria-label={t("Dil")} title={t("Dil")}>
-        {LANGS.map(([k, name]) => <option key={k} value={k}>{name}</option>)}
-      </select>
-      <button className="icon-btn" onClick={onToggleLog} aria-label={t("Kayıtlar")} title={t("Kayıtlar")}><ScrollText size={18} /></button>
-      <button className="icon-btn" onClick={onToggleSettings} aria-label={t("Ayarlar")} title={t("Ayarlar")}><SlidersHorizontal size={18} /></button>
-    </div>
+
+        <div className={`gpu-badge state-${rt.state}`}>
+          <span className="gpu-dot" />
+          <Cpu size={14} />
+          <span className="gpu-label">
+            {rt.state === "ready" && rt.gpu_name ? `${rt.gpu_name} · ${t("已就绪")}` : t(STATE_LABEL[rt.state])}
+          </span>
+        </div>
+
+        {rt.state === "off" || rt.state === "error" ? (
+          <button className="btn-ghost" onClick={onStart}>
+            <Power size={13} /> {t("启动 {gpu}", { gpu: rt.gpu_tier.toUpperCase() })}
+          </button>
+        ) : (
+          <button className="btn-ghost" onClick={onStop} disabled={busy}>
+            <Power size={13} /> {t("关闭")}
+          </button>
+        )}
+
+        <StartupPill rt={rt} startupEstimates={startupEstimates} />
+        <GpuStatsPill rt={rt} />
+        <ModelPackPill rt={rt} startupEstimates={startupEstimates} />
+      </div>
+
+      <div className="topbar-right">
+        {idleLeftMin !== null && (
+          <span
+            className="meta-pill"
+            title={`${t("空闲 {n}/{max} 分钟", { n: idleElapsedMin, max: idleMaxMin })} · ${t("空闲满 {n} 分钟自动关闭 GPU", { n: idleMaxMin })} (${t("剩余 {d}", { d: fmtDuration(rt.idle_timeout_s - rt.idle_s) })})`}
+          >
+            {t("自动关闭")} {idleLeftMin}m
+          </span>
+        )}
+        <CreditPill usage={usage} error={usageError} />
+        <div className="theme-seg" role="group" aria-label="Language">
+          {LANGS.map((l) => (
+            <button
+              key={l}
+              className={`theme-btn ${lang === l ? "active" : ""}`}
+              onClick={() => setLang(l)}
+              title={l === "zh" ? "中文" : "English"}
+            >
+              {l.toUpperCase()}
+            </button>
+          ))}
+        </div>
+        <div className="theme-seg" role="group">
+          {THEMES.map((th) => (
+            <button
+              key={th.id}
+              className={`theme-btn ${theme === th.id ? "active" : ""}`}
+              onClick={() => onTheme(th.id)}
+              title={t(th.label)}
+            >
+              {t(th.label)}
+            </button>
+          ))}
+        </div>
+        <button
+          className={`icon-btn ${showLogs ? "active" : ""}`}
+          onClick={onToggleLogs}
+          title={t("日志")}
+          aria-label={t("日志")}
+        >
+          <ScrollText size={15} />
+        </button>
+        <button
+          className={`icon-btn ${showSettings ? "active" : ""}`}
+          onClick={onToggleSettings}
+          title={t("设置")}
+          aria-label={t("设置")}
+        >
+          <SlidersHorizontal size={15} />
+        </button>
+      </div>
+    </header>
   );
 }

@@ -30,8 +30,8 @@ if ! uv --version 2>/dev/null | grep -q '^uv 0.13.4'; then
 fi
 if [ ! -x /content/hfenv/bin/python ]; then
     uv venv --python 3.12 /content/hfenv
-    uv pip install --python /content/hfenv/bin/python "huggingface_hub>=0.25,<1.0" "hf_transfer>=0.1.8"
 fi
+uv pip install --python /content/hfenv/bin/python 'huggingface_hub==1.20.1' 'hf_xet==1.8.0'
 
 if ! pgrep -f "/content/station/[m]odels.py" >/dev/null; then
     nohup /content/hfenv/bin/python /content/station/models.py "${INITIAL_PACKS[@]}" \

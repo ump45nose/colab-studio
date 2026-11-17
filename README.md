@@ -220,6 +220,21 @@ The default image model, Noct-Q V4, is an **uncensored** fine-tune. Switch to th
 Qwen-Image 2.1 file shown above if that is not what you want. Each model has its own license; check
 it on its Hugging Face page before using outputs commercially.
 
+### Kaggle free-GPU trials
+
+Generate a self-contained notebook with `python3.12 station/kaggle_trial.py prepare --mode faceswap`.
+Import the printed `trial.ipynb` into Kaggle, enable Internet and select T4 ×2. The default uses
+public sample images to compare the three swapper models. Repeat with `--mode image` or
+`--mode image_turbo` to test the two image workflows. Only GPU 0 is used; the two cards do not
+automatically combine their memory. Image trials check that the driver supports the existing
+CUDA 13 environment before installing it. Model files stay on scratch disk; generated media,
+timings, sampled GPU memory and `result.json` stay in `/kaggle/working`.
+
+Add `--owner YOUR_KAGGLE_USERNAME` to also generate private T4 submission metadata for
+`kaggle kernels push -p OUTPUT_DIRECTORY`. The bundle contains an explicit list of source files,
+with no local credentials or media. These are trial notebooks; automatic routing from the studio
+stays on Colab until actual Kaggle results have been checked.
+
 ## Using it from Claude Code (MCP)
 
 The [`mcp/`](mcp) folder contains an MCP server that lets Claude Code or Claude Desktop drive the

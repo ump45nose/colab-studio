@@ -2,7 +2,7 @@
 into `/content/models` and writes real-time status to `/content/models/.status.json`.
 
 Usage: `python3 models.py image` or `python3 models.py image video`
-Runs inside `/content/hfenv` (isolated `huggingface_hub` + `hf_transfer` environment).
+Runs inside an isolated `huggingface_hub` + `hf_xet` environment.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 from huggingface_hub import hf_hub_download, hf_hub_url
 
 import catalog
@@ -82,12 +82,24 @@ def _stream_url(url: str, dest: Path) -> None:
 
 
 def download_file(repo: str, filename: str, dest: Path) -> None:
-    """Download directly to `dest.with_suffix('.part')` then atomically rename to `dest`."""
+    """Use resumable Xet downloads first; fall back to HTTP if the Hub client fails."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     cache = dest.parent / ".hfcache"
     url = hf_hub_url(repo_id=repo, filename=filename)
-    last_err: Exception | None = None
+    try:
+        got = Path(hf_hub_download(
+            repo_id=repo, filename=filename, token=TOKEN,
+            local_dir=str(cache),
+        ))
+        if not got.is_file() or got.stat().st_size == 0:
+            raise RuntimeError("Hub 下载未产生有效文件")
+        got.replace(dest)
+        shutil.rmtree(cache, ignore_errors=True)
+        return
+    except Exception as e:
+        # Preserve the Hub client's partial files so a later attempt can resume.
+        print(f"[models] Hub/Xet 下载失败，尝试直连 ({dest.name}): {type(e).__name__}", flush=True)
     for attempt in range(3):
         try:
             part.unlink(missing_ok=True)
@@ -95,23 +107,14 @@ def download_file(repo: str, filename: str, dest: Path) -> None:
             if part.stat().st_size == 0:
                 raise RuntimeError("下载得到空文件")
             part.replace(dest)
+            shutil.rmtree(cache, ignore_errors=True)
             return
         except Exception as e:
-            last_err = e
-            print(f"[models] 直连流式下载重试 {attempt + 1}/3 ({dest.name}): {e}", flush=True)
+            part.unlink(missing_ok=True)
+            if attempt == 2:
+                raise
+            print(f"[models] 直连流式下载重试 {attempt + 1}/3 ({dest.name}): {type(e).__name__}", flush=True)
             time.sleep(2 ** attempt)
-    try:
-        got = Path(hf_hub_download(
-            repo_id=repo, filename=filename, token=TOKEN,
-            local_dir=str(cache),
-        ))
-        shutil.move(str(got), str(dest))
-        shutil.rmtree(cache, ignore_errors=True)
-    except Exception as e:
-        shutil.rmtree(cache, ignore_errors=True)
-        if last_err is not None:
-            raise last_err from e
-        raise
 
 
 def ensure_pack(name: str, state: dict) -> None:

@@ -1,0 +1,27 @@
+name: Build deployment image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "codex/**"]
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Linux image
+        run: docker build --platform linux/amd64 -t colab-studio:ci .
+      - name: Check service
+        run: |
+          docker run -d --name studio -p 127.0.0.1:18104:18104 colab-studio:ci
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:18104/api/state >/dev/null && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18104/api/state >/dev/null
+          curl -fsS http://127.0.0.1:18104/ | grep -q 'id="root"'
+      - name: Package image
+        run: docker save colab-studio:ci | gzip -1 > colab-studio-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: colab-studio-image
+          path: colab-studio-image.tar.gz
+          retention-days: 1

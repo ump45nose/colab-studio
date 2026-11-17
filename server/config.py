@@ -34,6 +34,7 @@ IDLE_TIMEOUT_MIN = int(
     os.environ.get("STUDIO_IDLE_MINUTES") or os.environ.get("IDLE_TIMEOUT_MIN") or "30"
 )
 GPU_TIER = (os.environ.get("GPU_TIER") or os.environ.get("STUDIO_GPU") or "l4").lower()
+SESSION_PREFIX = os.environ.get("STUDIO_SESSION") or "colab-studio"
 COLAB_BIN = (
     os.environ.get("COLAB_BIN")
     or shutil.which("colab")

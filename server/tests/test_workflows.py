@@ -28,6 +28,8 @@ def assert_valid_workflow(wf: dict[str, dict], kind: str) -> None:
         opt = schema["input"].get("optional", {})
         all_specs = {**req, **opt}
         inputs = node["inputs"]
+        if ct == "TextEncodeQwenImage21":
+            all_specs.update({f"images.image_{i}": ["IMAGE"] for i in range(1, 17)})
 
         title = node.get("_meta", {}).get("title")
         assert title in allowed_stages, (

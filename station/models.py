@@ -118,6 +118,7 @@ def ensure_pack(name: str, state: dict) -> None:
     items = PACKS[name]
     total_gb = round(sum(sz for *_, sz, _ in items), 2)
     pstate = state["packs"].setdefault(name, {"ready": False, "total_gb": total_gb, "done_gb": 0.0, "current": None})
+    pstate.pop("error", None)
     pstate["total_gb"] = total_gb
     done = 0.0
     for repo, hf_file, target, subdir, size_gb, sha256 in items:

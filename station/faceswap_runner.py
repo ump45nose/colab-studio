@@ -97,8 +97,7 @@ def build_facefusion_cmd(
         "--log-level",
         "info",
     ]
-    for src in source_paths:
-        cmd.extend(["-s", str(src)])
+    cmd.extend(["-s", *(str(src) for src in source_paths)])
     if enhancer_model != "none":
         cmd.extend([
             "--face-enhancer-model",

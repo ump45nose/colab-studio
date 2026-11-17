@@ -14,10 +14,10 @@
 # 图片主力工作流（默认）：Krea2-Noct / Noct-Q V4（支持文生图 + 多参考图编辑）
 # 也可将 diffusion 替换为 repo = "Noctaluna/Krea2-Noct-Uncensored", file = "KreaNoct_V4_int8_convrot.safetensors"
 [image]
-diffusion  = { repo = "Noctaluna/Noct-Q", file = "NoctQ_V4_int8_convrot.safetensors",        dir = "diffusion_models", size_gb = 8.1 }
-encoder    = { repo = "Noctaluna/Noct-Q", file = "qwen3vl_8b_int8_convrot.safetensors",      dir = "text_encoders",    size_gb = 8.4 }
-vae        = { repo = "Noctaluna/Noct-Q", file = "qwen_image_2.1_vae_bf16.safetensors",      dir = "vae",              size_gb = 0.25 }
-turbo_lora = { repo = "Noctaluna/Noct-Q", file = "Wuli-Qwen-Image-2512-Turbo-LoRA-2steps-V1.0-bf16.safetensors", dir = "loras", size_gb = 0.7 }
+diffusion  = { repo = "Noctaluna/Noct-Q-Uncensored-Qwen-Image-2.1", file = "NoctQ_V4_int8_convrot.safetensors", dir = "diffusion_models", size_gb = 7.26 }
+encoder    = { repo = "Comfy-Org/Qwen-Image-2.1", file = "text_encoders/qwen3vl_8b_int8_convrot.safetensors", dir = "text_encoders", size_gb = 8.71 }
+vae        = { repo = "Comfy-Org/Qwen-Image-2.1", file = "vae/qwen_image_2.1_vae_bf16.safetensors", dir = "vae", size_gb = 0.65 }
+turbo_lora = { repo = "Comfy-Org/Qwen-Image-2.1", file = "loras/qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors", dir = "loras", size_gb = 0.7 }
 
 # 图片极速工作流：Z-Image-Turbo NSFW BF16（8 步 CFG=1.0 极速出图）
 [image_turbo]
@@ -27,11 +27,11 @@ vae       = { repo = "Comfy-Org/z_image_turbo",       file = "split_files/vae/ae
 
 # 视频工作流 A（默认）：MiniMax-H3（文生视频 / 首尾帧图生视频，带音轨）
 [video]
-diffusion  = { repo = "Comfy-Org/MiniMax-H3", file = "split_files/diffusion_models/minimax_h3_fl2va_pruned_w6a8.safetensors",        target = "minimax_h3_fl2va_pruned_w6a8.safetensors",            dir = "diffusion_models", size_gb = 18.6 }
-encoder    = { repo = "Comfy-Org/MiniMax-H3", file = "split_files/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",       target = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",        dir = "text_encoders",    size_gb = 21.1 }
-video_vae  = { repo = "Comfy-Org/MiniMax-H3", file = "split_files/vae/minimax_h3_video_vae_int8_convrot.safetensors",                target = "minimax_h3_video_vae_int8_convrot.safetensors",       dir = "vae",              size_gb = 1.3 }
-audio_vae  = { repo = "Comfy-Org/MiniMax-H3", file = "split_files/vae/minimax_h3_audio_vae_fp32.safetensors",                        target = "minimax_h3_audio_vae_fp32.safetensors",               dir = "vae",              size_gb = 0.2 }
-turbo_lora = { repo = "Comfy-Org/MiniMax-H3", file = "split_files/loras/minimax_h3_fl2va_turbo_lora_rank128_bf16.safetensors",       target = "minimax_h3_fl2va_turbo_lora_rank128_bf16.safetensors", dir = "loras",            size_gb = 0.8 }
+diffusion  = { repo = "Comfy-Org/MiniMax-H3", file = "diffusion_models/minimax_h3_fl2va_pruned_w6a8.safetensors", dir = "diffusion_models", size_gb = 16 }
+encoder    = { repo = "Comfy-Org/MiniMax-H3", file = "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", dir = "text_encoders", size_gb = 21.1 }
+video_vae  = { repo = "Comfy-Org/MiniMax-H3", file = "vae/minimax_h3_video_vae_int8_convrot.safetensors", dir = "vae", size_gb = 1.3 }
+audio_vae  = { repo = "Comfy-Org/MiniMax-H3", file = "vae/minimax_h3_audio_vae_fp32.safetensors", dir = "vae", size_gb = 0.2 }
+turbo_lora = { repo = "Comfy-Org/MiniMax-H3", file = "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", dir = "loras", size_gb = 0.8 }
 
 # 视频工作流 B：Wan2.2-Remix A14B High/Low Noise 双阶段 FP8 图生视频/文生视频
 [video_wan22]

@@ -1,11 +1,11 @@
-"""DreamID-V Faster (`wan_swapface.py`) 81-frame video slicing & concat orchestrator.
+"""DreamID-V Faster 81-frame video slicing & concat helpers.
 
 Why this module exists:
-`DreamID-V/express_adaption/wan_swapface.py` only loads the first `frame_num=81` frames
+`DreamID-V/generate_dreamidv_faster.py` processes at most `frame_num=81` frames
 (`4n + 1`, ~3.37s at 24fps) of a target video and discards the rest. To support arbitrary-length
 videos without modifying `DreamID-V`'s internal diffusion tensor shapes, this orchestrator:
 1. Splits the input video into contiguous `<= 81`-frame segments via FFmpeg.
-2. Runs `wan_swapface.py` on each segment (aligning `frame_num` to `4n + 1`).
+2. Runs the Faster model on each segment (aligning `frame_num` to `4n + 1`).
 3. Concatenates all swapped segments via FFmpeg `concat` demuxer and muxes back the original audio track.
 """
 from __future__ import annotations
@@ -79,9 +79,9 @@ def build_wan_swapface_cmd(
     dreamid_ckpt: str | Path = "/content/models/dreamid_v/dreamidv_faster.pth",
     python_bin: str = "python3",
 ) -> list[str]:
-    """Build the `wan_swapface.py` CLI invocation for a single `<= 81`-frame slice."""
+    """Build the Faster CLI invocation for a single `<= 81`-frame slice."""
     aligned_frames = align_4n_plus_1(frame_count)
-    script = Path(dreamid_dir) / "express_adaption" / "wan_swapface.py"
+    script = Path(dreamid_dir) / "generate_dreamidv_faster.py"
     return [
         python_bin,
         str(script),
@@ -97,10 +97,12 @@ def build_wan_swapface_cmd(
         str(int(sample_steps)),
         "--frame_num",
         str(aligned_frames),
-        "--Sample_guide_scale_img",
+        "--sample_guide_scale_img",
         "4.0",
-        "--ref_Path",
-        f"{chunk_video},{source_image}",
+        "--ref_video",
+        str(chunk_video),
+        "--ref_image",
+        str(source_image),
         "--save_file",
         str(output_chunk),
     ]
@@ -135,6 +137,8 @@ def build_ffmpeg_concat_mux_cmd(
         "18",
         "-c:a",
         "aac",
+        "-af",
+        "apad",
         "-shortest",
         str(final_output),
     ]

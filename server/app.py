@@ -90,14 +90,15 @@ def _image_params(p: dict, n_inputs: int) -> dict:
     edit_res = p.get("edit_resolution", 1080)
     if edit_res not in workflows.EDIT_RESOLUTIONS:
         raise _bad(f"无效的编辑分辨率: {edit_res}")
-    sampler = p.get("sampler", "euler")
+    is_z_turbo = profile == "z_image_turbo_nsfw" and n_inputs == 0
+    sampler = p.get("sampler", "res_multistep" if is_z_turbo else "euler")
     if sampler not in workflows.SAMPLERS:
         raise _bad(f"无效的采样器 (sampler): {sampler}")
     scheduler = p.get("scheduler", "simple")
     if scheduler not in workflows.SCHEDULERS:
         raise _bad(f"无效的调度器 (scheduler): {scheduler}")
-    steps = _num(p.get("steps", 25), "步数", 4, 50, integer=True)
-    cfg = _num(p.get("cfg", 3.0), "CFG", 1.0, 10.0)
+    steps = _num(p.get("steps", 8 if is_z_turbo else 25), "步数", 4, 50, integer=True)
+    cfg = _num(p.get("cfg", 1.0 if is_z_turbo else 3.0), "CFG", 1.0, 10.0)
     count = _num(p.get("count", 1), "张数", 1, 4, integer=True)
     turbo = bool(p.get("turbo", False))
     if n_inputs > 0 and edit_res == 2160 and cfg > 1.0 and steps >= 20:
@@ -344,6 +345,10 @@ async def create_job(req: Request):
     if not isinstance(raw_params, dict):
         raise _bad("params 必须是一个对象")
     params = _image_params(raw_params, len(inputs)) if kind == "image" else _validate_params(kind, raw_params)
+
+    if (kind == "faceswap" and params.get("engine") == "dreamid_v_faster"
+            and Path(inputs[-1]).suffix.lower() not in (".mp4", ".webm", ".mov")):
+        raise _bad("DreamID-V Faster 需要视频作为目标素材")
 
     if kind == "faceswap" and not prompt:
         if params.get("compare_all"):

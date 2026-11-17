@@ -12,15 +12,18 @@ services:
     environment:
       # Fixed inside the container; publish the port below instead.
       STUDIO_HOST: 0.0.0.0
-      STUDIO_PORT: "8190"
+      STUDIO_PORT: "18104"
       STUDIO_DATA: /data
+      HOME: /home/studio
+      XDG_DATA_HOME: /home/studio/.config/colab-cli
+      PYTHON_KEYRING_BACKEND: keyrings.alt.file.PlaintextKeyring
     ports:
       # STUDIO_HOST / STUDIO_PORT from .env choose the host address: 127.0.0.1 (this computer only)
       # or 0.0.0.0 (reachable by IP, no password).
-      - "${STUDIO_HOST:-127.0.0.1}:${STUDIO_PORT:-8190}:8190"
+      - "${STUDIO_HOST:-127.0.0.1}:${STUDIO_PORT:-8190}:18104"
     volumes:
       - studio-data:/data
-      - colab-login:/root/.config/colab-cli
+      - colab-login:/home/studio/.config/colab-cli
       # Custom model catalog (optional): create models.toml next to this file, then uncomment.
       # - ./models.toml:/app/models.toml:ro
     # Releasing the GPU on shutdown can take a few minutes.

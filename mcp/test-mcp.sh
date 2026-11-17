@@ -16,36 +16,9 @@ const child = spawn("node", ["dist/index.js"], {
 // Araç sayısı değil, isim listesi doğrulanır: yeni araç eklemek testi kırmaz, silinen/yeniden
 // adlandırılan araç yakalanır.
 const EXPECTED_TOOLS = [
-  "colab_runtime_status",
-  "colab_runtime_start",
-  "colab_runtime_stop",
-  "colab_runtime_toggle_auto",
-  "colab_runtime_metrics",
-  "colab_runtime_logs",
-  "colab_sessions_raw",
-  "generate_image",
-  "enhance_prompt",
-  "generate_video",
-  "generate_music",
-  "generate_speech",
-  "transcribe_audio",
-  "generate_3d",
-  "get_job",
-  "wait_for_job",
-  "cancel_job",
-  "list_media",
-  "get_media_base64",
-  "upload_media",
-  "list_threads",
-  "get_thread",
-  "delete_thread",
-  "list_presets",
-  "save_preset",
-  "delete_preset",
-  "get_settings",
-  "update_setting",
-  "get_system_status",
-  "restart_colab_studio"
+  "get_studio_status", "start_gpu", "stop_gpu", "get_compute_usage",
+  "generate_image", "generate_video", "swap_face", "get_job", "wait_for_job",
+  "cancel_job", "upload_media", "list_chats", "delete_chat", "save_preset", "delete_preset"
 ];
 
 let buffer = "";
@@ -101,18 +74,18 @@ child.stdout.on("data", (chunk) => {
         fail(`Duplicate tool registrations: ${duplicates.join(", ")}`);
       }
       console.log(`✔ Step 2: Tools list passed! Registered ${tools.length} tools, all ${EXPECTED_TOOLS.length} expected tools present.`);
-      send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "colab_runtime_status", arguments: {} } });
+      send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_studio_status", arguments: {} } });
     } else if (msg.id === 3) {
       if (msg.result?.isError) {
-        fail(`colab_runtime_status returned an error: ${JSON.stringify(msg.result.content).slice(0, 300)}`);
+        fail(`get_studio_status returned an error: ${JSON.stringify(msg.result.content).slice(0, 300)}`);
       }
-      console.log("✔ Step 3: Tool call colab_runtime_status passed!");
-      send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "get_system_status", arguments: {} } });
+      console.log("✔ Step 3: Tool call get_studio_status passed!");
+      send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "list_chats", arguments: {} } });
     } else if (msg.id === 4) {
       if (msg.result?.isError) {
-        fail(`get_system_status returned an error: ${JSON.stringify(msg.result.content).slice(0, 300)}`);
+        fail(`list_chats returned an error: ${JSON.stringify(msg.result.content).slice(0, 300)}`);
       }
-      console.log("✔ Step 4: Tool call get_system_status passed!");
+      console.log("✔ Step 4: Tool call list_chats passed!");
       send({ jsonrpc: "2.0", id: 5, method: "resources/list", params: {} });
     } else if (msg.id === 5) {
       console.log(`✔ Step 5: Resources list passed! (${msg.result.resources.length} resources)`);

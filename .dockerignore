@@ -11,3 +11,6 @@ mcp/dist
 **/playwright-report
 mcp
 models.toml
+.work-cache
+.dreamid-source-check
+outputs

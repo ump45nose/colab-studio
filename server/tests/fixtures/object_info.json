@@ -153,8 +153,8 @@
     "input": {
       "required": {
         "model": ["MODEL"],
-        "device": [["gpu", "cpu"]],
-        "dtype": [["bf16", "fp16"]]
+        "device": [["auto", "gpu", "cpu", "off"]],
+        "dtype": [["default", "int8", "int4"]]
       }
     },
     "output": ["MODEL"]
@@ -190,8 +190,8 @@
       "required": {
         "video": ["VIDEO"],
         "filename_prefix": ["STRING", {}],
-        "format": [["mp4", "webm"]],
-        "codec": [["h264", "vp9"]]
+        "format": [["auto", "mp4", "mkv", "webm"]],
+        "format.codec": [["auto", "h264", "av1"]]
       }
     },
     "output": ["VIDEO"]

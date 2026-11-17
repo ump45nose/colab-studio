@@ -174,7 +174,7 @@ export function registerStudioTools(server: McpServer): void {
       inputSchema: {
         mode: MODE_ENUM,
         name: z.string().min(1).max(40),
-        params: z.record(z.unknown()),
+        params: z.record(z.string(), z.unknown()),
       },
     },
     async ({ mode, name, params }) =>

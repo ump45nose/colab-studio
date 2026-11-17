@@ -150,4 +150,5 @@ def test_dreamid_plan_frame_chunks():
     )
     assert "--frame_num" in wan_cmd
     assert wan_cmd[wan_cmd.index("--frame_num") + 1] == "81"
-    assert wan_cmd[wan_cmd.index("--ref_Path") + 1] == "chunk0.mp4,face.png"
+    assert wan_cmd[wan_cmd.index("--ref_video") + 1] == "chunk0.mp4"
+    assert wan_cmd[wan_cmd.index("--ref_image") + 1] == "face.png"

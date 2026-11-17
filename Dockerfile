@@ -14,7 +14,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY server/requirements.txt server/requirements.txt
-RUN pip install --no-cache-dir -r server/requirements.txt google-colab-cli \
+RUN pip install --no-cache-dir -r server/requirements.txt google-colab-cli==0.8.0 keyrings.alt==5.0.2 \
  && groupadd --gid 1001 studio \
  && useradd --uid 1000 --gid 1001 --create-home --home-dir /home/studio studio \
  && install -d -m 0755 -o 1000 -g 1001 /data /home/studio/.config/colab-cli

@@ -4,7 +4,7 @@ name: test
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "codex/**"]
   pull_request:
 
 jobs:
@@ -19,8 +19,7 @@ jobs:
         working-directory: server/web
         run: npm ci && npm run build
       - name: Pytest
-        working-directory: server
-        run: uv run -q --python 3.12 --with-requirements requirements.txt --with pytest --with pytest-aiohttp --with pytest-asyncio pytest -q
+        run: uv run -q --no-project --python 3.12 --with-requirements server/requirements.txt --with pytest --with pytest-asyncio pytest -q server/tests
 
   ui:
     runs-on: ubuntu-latest
@@ -59,14 +58,13 @@ jobs:
       - name: Protocol check against a GPU-less studio
         run: |
           mkdir -p server/web/dist && echo '<!doctype html>' > server/web/dist/index.html && mkdir -p server/web/dist/assets
-          export STUDIO_DATA=$(mktemp -d) STUDIO_PORT=8190 COLAB_BIN=/bin/false
-          cd server
-          uv run -q --python 3.12 --with-requirements requirements.txt python app.py &
+          export STUDIO_DATA="$GITHUB_WORKSPACE/.ci-data" STUDIO_PORT=8190 COLAB_BIN=/bin/false COLAB_STUDIO_URL=http://127.0.0.1:8190
+          uv run -q --no-project --python 3.12 --with-requirements server/requirements.txt uvicorn server.app:app --host 127.0.0.1 --port 8190 &
           studio=$!
           # The studio must be stopped before the job ends: a running `uv run` holds uv's cache lock.
           trap 'kill $studio; wait $studio || true' EXIT
-          for _ in $(seq 30); do curl -sf 127.0.0.1:8190/api/runtime >/dev/null && break; sleep 1; done
-          bash ../mcp/test-mcp.sh
+          for _ in $(seq 30); do curl -sf 127.0.0.1:8190/api/state >/dev/null && break; sleep 1; done
+          bash mcp/test-mcp.sh
 
   docker:
     runs-on: ubuntu-latest
@@ -76,7 +74,7 @@ jobs:
         run: docker build -t colab-studio .
       - name: Smoke test
         run: |
-          docker run -d --name studio -p 127.0.0.1:8190:8190 colab-studio
-          for _ in $(seq 30); do curl -sf 127.0.0.1:8190/api/runtime && break; sleep 1; done
+          docker run -d --name studio -p 127.0.0.1:8190:18104 colab-studio
+          for _ in $(seq 30); do curl -sf 127.0.0.1:8190/api/state && break; sleep 1; done
           curl -sf 127.0.0.1:8190/ | grep -q '<div id="root">'
           docker logs studio

@@ -5,11 +5,11 @@ test("Language toggle switches UI between Chinese (ZH) and English (EN)", async 
   await installMocks(page);
   await page.goto("/");
 
-  await expect(page.getByRole("button", { name: "图片" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "图片", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "EN", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Image" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "FaceSwap" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Image", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "FaceSwap", exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "ZH", exact: true }).click();
-  await expect(page.getByRole("button", { name: "换脸" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "换脸", exact: true })).toBeVisible();
 });

@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shlex
 import shutil
 import subprocess
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 from . import config, tracker
@@ -19,6 +21,9 @@ COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
 IDLE_TIMEOUT = config.IDLE_TIMEOUT_MIN * 60
 HEALTH_FAIL_LIMIT = 3
 SETUP_STALL_TIMEOUT = 15 * 60
+SESSION_FILE = config.DATA_DIR / "studio_session.json"
+SSH_KEY = config.DATA_DIR / "ssh" / "id_ed25519"
+COLAB_SESSIONS = Path("~/.config/colab-cli/sessions.json").expanduser()
 
 PACK_LABELS = {
     "image": "图片 (Krea2-Noct)",
@@ -33,17 +38,19 @@ def _check_host_tools() -> None:
         raise RuntimeError(
             f"未找到 colab CLI ({config.COLAB_BIN})：请运行 ./install.sh 或在 .env 中设置 COLAB_BIN"
         )
-    for tool in ("ssh", "tar"):
+    for tool in ("ssh", "ssh-keygen", "tar"):
         if not shutil.which(tool):
             raise RuntimeError(f"未找到 {tool}：需安装 openssh-client 和 tar")
 
 
 def _clean_err(raw: str) -> str:
+    if config.HF_TOKEN:
+        raw = raw.replace(config.HF_TOKEN, "[redacted]")
     lines = [
         ln.strip() for ln in raw.splitlines()
         if ln.strip() and not ln.startswith(("WARNING:", "Warning: Permanently added"))
     ]
-    msg = lines[-1] if lines else raw.strip()
+    msg = "\n".join(lines[-40:])[-4000:] if lines else raw.strip()[-4000:]
     if "not authenticated" in msg.lower() or "colab auth login" in msg.lower():
         if Path("/.dockerenv").exists():
             return "colab CLI 未登录 Google：请执行 'docker compose run --rm studio colab usage' 完成登录，然后重新启动 GPU"
@@ -111,7 +118,7 @@ class Runtime:
     def _cmd(self, *args: str) -> list[str]:
         if args and args[0] == "ssh" and self._ssh_host:
             return ["ssh", *self._ssh_flags, self._ssh_host, *args[1:]]
-        return [config.COLAB_BIN, "--gpu", config.GPU_TIER, *args]
+        return [config.COLAB_BIN, *args]
 
     async def _run(self, *args: str, timeout: int = 120) -> str:
         cmd = self._cmd(*args)
@@ -125,10 +132,10 @@ class Runtime:
                 proc.kill()
             except ProcessLookupError:
                 pass
-            raise RuntimeError(f"执行超时 ({timeout}s): {' '.join(args[:2])}") from e
+            raise RuntimeError(f"执行超时 ({timeout}s): {args[0]}") from e
         if proc.returncode != 0:
             msg = _clean_err(err.decode(errors="replace") or out.decode(errors="replace"))
-            raise RuntimeError(msg or f"命令执行失败 ({proc.returncode}): {' '.join(args[:2])}")
+            raise RuntimeError(msg or f"命令执行失败 ({proc.returncode}): {args[0]}")
         return out.decode(errors="replace").strip()
 
     async def ssh(self, remote_cmd: str, timeout: int = 120) -> str:
@@ -158,25 +165,64 @@ class Runtime:
         part.replace(local_path)
 
     async def _load_ssh_config(self) -> None:
-        raw = await self._run("ssh", "--raw", timeout=180)
-        tokens = shlex.split(raw)
-        if not tokens or tokens[0] != "ssh":
-            raise RuntimeError(f"无法解析 ssh --raw 输出: {raw[:120]}")
+        # Resume our recorded session after an unclean server restart. Session names
+        # are unique to this studio, so unrelated Colab sessions are never touched.
+        SSH_KEY.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not SSH_KEY.exists():
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(SSH_KEY)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode:
+                raise RuntimeError(f"创建 SSH 密钥失败: {result.stderr.strip()}")
+        # Some NAS bind mounts apply inherited ACLs that make new keys too open
+        # for OpenSSH even when ssh-keygen requested mode 0600.
+        SSH_KEY.chmod(0o600)
+        resume = SESSION_FILE.exists()
+        session = json.loads(SESSION_FILE.read_text()).get("name", "") if resume else f"{config.SESSION_PREFIX}-{uuid.uuid4().hex[:12]}"
+        if not isinstance(session, str):
+            raise RuntimeError("工作台会话记录无效")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+-[0-9a-f]{12}", session):
+            raise RuntimeError("STUDIO_SESSION 只能包含字母、数字、下划线和连字符")
+        if not resume:
+            SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SESSION_FILE.write_text(json.dumps({"name": session}))
+            await self._run("new", "--gpu", config.GPU_TIER.upper(), "-s", session, timeout=600)
+        proxy = shlex.join([
+            "sh", str(Path(__file__).with_name("colab_proxy.sh")), session,
+            str(COLAB_SESSIONS), config.COLAB_BIN, str(SSH_KEY),
+        ]).replace("%", "%%")
         self._ssh_flags = [
+            "-o", f"ProxyCommand={proxy}",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR",
+            "-o", "IdentitiesOnly=yes",
+            "-i", str(SSH_KEY),
+            "-o", "ConnectTimeout=60",
             "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=300",
-            "-o", "ControlPath=/tmp/colab-ssh-%C",
-            "-o", "ConnectTimeout=15",
-            *tokens[1:-1],
+            "-o", "ControlPersist=600",
+            "-o", f"ControlPath={SSH_KEY.parent / ('control-' + session[-12:])}",
         ]
-        self._ssh_host = tokens[-1]
+        self._ssh_host = "root@colab-studio"
+
+    async def _stop_owned_session(self) -> None:
+        if not SESSION_FILE.exists():
+            return
+        data = json.loads(SESSION_FILE.read_text())
+        session = data.get("name", "")
+        if not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9_-]+-[0-9a-f]{12}", session):
+            raise RuntimeError("工作台会话记录无效，无法安全关闭远端会话")
+        await self._run("stop", "-s", session, timeout=60)
+        SESSION_FILE.unlink(missing_ok=True)
 
     def _ship_station_sync(self, tar_cmd: list[str], ssh_cmd: list[str]) -> tuple[int, str]:
         t_proc = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE)
         s_proc = subprocess.Popen(ssh_cmd, stdin=t_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert t_proc.stdout is not None
         t_proc.stdout.close()
-        _, err = s_proc.communicate(timeout=60)
+        _, err = s_proc.communicate(timeout=120)
         t_proc.wait(timeout=5)
         return s_proc.returncode, err.decode(errors="replace").strip()
 
@@ -255,7 +301,7 @@ class Runtime:
             self.step = f"错误: {e}"
             self._log(f"错误: {e}")
             self._kill_tunnel()
-            if self._ssh_host:
+            if SESSION_FILE.exists():
                 self._log("启动失败，正在释放远端 GPU 以避免空转扣费...")
                 await self._force_disconnect("启动失败，正在关闭")
             raise
@@ -263,16 +309,16 @@ class Runtime:
     async def _run_setup_Remote(self) -> None:
         hf = shlex.quote(config.HF_TOKEN)
         await self.ssh(
-            "pgrep -f '/content/station/runtime_setup.sh' >/dev/null || "
-            f"nohup env HF_TOKEN={hf} bash /content/station/runtime_setup.sh image "
-            "> /content/setup.log 2>&1 < /dev/null &"
+            "if ! pgrep -f '/content/station/[r]untime_setup.sh' >/dev/null; then "
+            f"nohup env HF_TOKEN={hf} bash /content/station/[r]untime_setup.sh image "
+            "> /content/setup.log 2>&1 < /dev/null & fi"
         )
         while True:
             await asyncio.sleep(4)
             await self._refresh_telemetry()
             state = await self.ssh(
                 "if [ -f /content/.setup_done ]; then echo done; "
-                "elif pgrep -f '/content/station/runtime_setup.sh' >/dev/null; then echo running; "
+                "elif pgrep -f '/content/station/[r]untime_setup.sh' >/dev/null; then echo running; "
                 "else echo failed; fi",
                 timeout=30,
             )
@@ -285,21 +331,17 @@ class Runtime:
 
     async def _start_comfy(self) -> None:
         cmd = (
-            "pgrep -f '/content/ComfyUI/main.py' >/dev/null || "
-            "nohup python3 /content/ComfyUI/main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch "
-            "> /content/comfy.log 2>&1 < /dev/null &"
+            "if ! pgrep -f '/content/ComfyUI/[m]ain.py' >/dev/null; then "
+            "nohup /content/comfyenv/bin/python /content/ComfyUI/[m]ain.py --listen 127.0.0.1 --port 8188 --disable-auto-launch "
+            "> /content/comfy.log 2>&1 < /dev/null & fi"
         )
         await self.ssh(cmd)
 
     def _spawn_tunnel_proc(self) -> None:
         self._kill_tunnel()
-        subprocess.run(
-            ["ssh", *self._ssh_flags, "-O", "exit", self._ssh_host],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
-        )
         cmd = [
             "ssh", *self._ssh_flags, "-N",
-            "-o", "ControlMaster=no", "-o", "ControlPath=none",
+            "-o", "ControlMaster=no",
             "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=3",
             "-o", "ExitOnForwardFailure=yes",
             "-L", f"127.0.0.1:{COMFY_PORT}:127.0.0.1:8188",
@@ -322,18 +364,13 @@ class Runtime:
             except subprocess.TimeoutExpired:
                 self._tunnel.kill()
         self._tunnel = None
-        if self._ssh_host:
-            subprocess.run(
-                ["ssh", *self._ssh_flags, "-O", "exit", self._ssh_host],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
-            )
 
     async def _wait_comfy_http(self) -> None:
         for i in range(90):
             if self._Comfy_alive():
                 return
             if i % 5 == 4:
-                alive = await self.ssh("pgrep -f '/content/ComfyUI/main.py' >/dev/null && echo y || echo n")
+                alive = await self.ssh("pgrep -f '/content/ComfyUI/[m]ain.py' >/dev/null && echo y || echo n")
                 if alive != "y":
                     tail = await self.ssh("tail -n 20 /content/comfy.log 2>/dev/null || true")
                     raise RuntimeError(f"ComfyUI 进程异常退出:\n{tail[-500:]}")
@@ -351,7 +388,7 @@ class Runtime:
     async def _force_disconnect(self, reason: str) -> None:
         for attempt in range(3):
             try:
-                await self._run("disconnect", timeout=30)
+                await self._stop_owned_session()
                 self._ssh_host = ""
                 self._ssh_flags = []
                 self._log(f"GPU 已断开连接 ({reason})")
@@ -369,7 +406,7 @@ class Runtime:
             self._log(f"正在关闭 GPU: {reason}")
             self._kill_tunnel()
             try:
-                await self._run("disconnect", timeout=30)
+                await self._stop_owned_session()
             except Exception as e:
                 self._log(f"disconnect 错误: {e}")
                 self.state = "error"
@@ -390,7 +427,7 @@ class Runtime:
 
     async def disconnect_on_shutdown(self) -> None:
         self._kill_tunnel()
-        if self.state in ("ready", "starting", "error") and self._ssh_host:
+        if self.state in ("ready", "starting", "error") and SESSION_FILE.exists():
             await self._force_disconnect("服务停止")
 
     # --- Model pack download & telemetry -----------------------------------
@@ -409,9 +446,9 @@ class Runtime:
             hf = shlex.quote(config.HF_TOKEN)
             qpack = shlex.quote(pack)
             await self.ssh(
-                f"pgrep -f 'models.py.*{qpack}' >/dev/null || "
-                f"nohup env HF_TOKEN={hf} /content/hfenv/bin/python /content/station/models.py {qpack} "
-                ">> /content/models.log 2>&1 < /dev/null &"
+                f"if ! pgrep -f '[m]odels.py.*{qpack}' >/dev/null; then "
+                f"nohup env HF_TOKEN={hf} /content/hfenv/bin/python /content/station/[m]odels.py {qpack} "
+                ">> /content/models.log 2>&1 < /dev/null & fi"
             )
             while True:
                 await asyncio.sleep(2)
@@ -431,9 +468,9 @@ class Runtime:
                     last_done = done
                     last_advance = time.time()
                 elif time.time() - last_advance > SETUP_STALL_TIMEOUT:
-                    await self.ssh("pkill -f '/content/station/models.py' || true")
+                    await self.ssh("pkill -f '/content/station/[m]odels.py' || true")
                     raise RuntimeError(f"{label} 模型连续 {SETUP_STALL_TIMEOUT // 60} 分钟无进度，下载卡死")
-                running = await self.ssh(f"pgrep -f 'models.py.*{qpack}' >/dev/null && echo y || echo n")
+                running = await self.ssh(f"pgrep -f '[m]odels.py.*{qpack}' >/dev/null && echo y || echo n")
                 if running != "y":
                     await self._refresh_telemetry()
                     p = self.models.get("packs", {}).get(pack, {})
@@ -467,13 +504,14 @@ class Runtime:
             self.setup_step = step_line or None
             data = json.loads(status_raw or "{}")
             if data:
-                part_gb = 0.0
+                part_sizes: dict[str, float] = {}
                 for ln in parts_raw.splitlines():
                     toks = ln.rsplit(" ", 1)
                     if len(toks) == 2 and toks[1].isdigit():
-                        part_gb += int(toks[1]) / 1e9
+                        part_sizes[Path(toks[0]).name] = int(toks[1]) / 1e9
                 for p in data.get("packs", {}).values():
                     if p.get("current") and not p.get("ready"):
+                        part_gb = part_sizes.get(f"{p['current']}.part", 0.0)
                         total_p = float(p.get("total_gb") or 0)
                         base = float(p.get("done_gb") or 0)
                         p["done_gb"] = round(min(total_p, base + part_gb), 2)
@@ -485,7 +523,7 @@ class Runtime:
             pass
 
     async def fetch_usage(self) -> dict:
-        cmd = [config.COLAB_BIN, "usage", "--json"]
+        cmd = [config.COLAB_BIN, "usage"]
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
@@ -493,14 +531,12 @@ class Runtime:
         if proc.returncode != 0:
             msg = _clean_err(err.decode(errors="replace") or out.decode(errors="replace"))
             raise RuntimeError(msg or "无法读取 colab usage 输出")
-        try:
-            data = json.loads(out.decode(errors="replace"))
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"无法解析 colab usage 输出: {e}") from e
-        rates = data.get("burn_rates_hourly") or {}
-        if "a100" in rates and "g2-standard-12" not in rates:
-            rates["g2-standard-12"] = round(rates["a100"] * 0.4, 2)
-        return data
+        usage = out.decode(errors="replace")
+        balance = re.search(r"Current balance:\s*([\d.]+)", usage)
+        rate = re.search(r"Usage rate:\s*([\d.]+)", usage)
+        if not balance or not rate:
+            raise RuntimeError("无法解析 Colab 算力余额")
+        return {"balance": float(balance.group(1)), "burn_rates_hourly": {config.GPU_TIER: float(rate.group(1))}}
 
     # --- Watchdog ----------------------------------------------------------
 
@@ -508,7 +544,12 @@ class Runtime:
         health_fails = 0
         while True:
             await asyncio.sleep(20)
-            if self.state == "error" and self._ssh_host:
+            if self.state == "off" and SESSION_FILE.exists():
+                async with self._lock:
+                    if self.state == "off" and SESSION_FILE.exists():
+                        await self._force_disconnect("恢复上次未关闭的工作台会话")
+                continue
+            if self.state == "error" and SESSION_FILE.exists():
                 await self._force_disconnect("错误恢复")
                 continue
             if self.state != "ready":

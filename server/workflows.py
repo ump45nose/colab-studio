@@ -160,7 +160,7 @@ def image_generate(
 
     wf: dict[str, dict] = {
         "1": _node("UNETLoader", "正在加载模型", unet_name=IMG["diffusion"], weight_dtype="default"),
-        "2": _node("CLIPLoader", "正在加载模型", clip_name=IMG["encoder"], type="krea2"),
+        "2": _node("CLIPLoader", "正在加载模型", clip_name=IMG["encoder"], type="qwen_image"),
         "3": _node("VAELoader", "正在加载模型", vae_name=IMG["vae"]),
         "7": _node("VAEDecode", "正在保存", samples=["6", 0], vae=["3", 0]),
         "8": _node("SaveImage", "正在保存", images=["7", 0], filename_prefix="studio_img"),
@@ -169,30 +169,24 @@ def image_generate(
     if turbo:
         wf["10"] = _node("LoraLoaderModelOnly", "正在加载模型", model=unet_out, lora_name=IMG["turbo_lora"], strength_model=1.0)
         unet_out = ["10", 0]
-    wf["4"] = _node("ModelSamplingSD3", "正在加载模型", model=unet_out, shift=3.0)
+    wf["4"] = _node("QwenImage21Cache", "正在加载模型", model=unet_out, device="auto", dtype="default")
 
     if refs:
-        wf["9"] = _node("QwenImage21Cache", "正在读取参考图", model=["4", 0], device="gpu", dtype="bf16")
-        model_ref = ["9", 0]
-        load_ids: list[list] = []
+        model_ref = ["4", 0]
+        image_inputs: dict[str, list] = {}
         for idx, name in enumerate(refs[:10]):
             nid = str(20 + idx)
             wf[nid] = _node("LoadImage", "正在读取参考图", image=name)
-            load_ids.append([nid, 0])
-        if len(load_ids) == 1:
-            img_ref = load_ids[0]
-        else:
-            wf["30"] = _node("BatchImagesNode", "正在读取参考图", images=load_ids)
-            img_ref = ["30", 0]
+            image_inputs[f"images.image_{idx + 1}"] = [nid, 0]
         wf["5"] = _node(
             "TextEncodeQwenImage21",
             "正在编码提示词",
             clip=["2", 0],
             vae=["3", 0],
-            images=img_ref,
             prompt=prompt,
             negative_prompt=negative,
             resolution=edit_resolution,
+            **image_inputs,
         )
         latent_ref = ["5", 2]
     else:
@@ -306,7 +300,7 @@ def _video_wan22_remix(
     )
     wf["12"] = _node("VAEDecode", "正在保存", samples=["11", 0], vae=["4", 0])
     wf["13"] = _node("CreateVideo", "正在保存", images=["12", 0], fps=fps)
-    wf["14"] = _node("SaveVideo", "正在保存", video=["13", 0], filename_prefix="studio_vid", format="mp4", codec="h264")
+    wf["14"] = _node("SaveVideo", "正在保存", video=["13", 0], filename_prefix="studio_vid", format="auto", **{"format.codec": "auto"})
     return wf
 
 
@@ -337,7 +331,8 @@ def video_generate(
 
     res_map = VIDEO_RESOLUTIONS.get(resolution, VIDEO_RESOLUTIONS["480p"])
     w, h = res_map.get(ratio, (832, 480))
-    frames = max(21, round((seconds * 24 - 4) / 17) * 17 + 4)
+    n = max(5, round(seconds * 24))
+    frames = n + (5 - n % 17) % 17
     turbo = quality == "turbo"
 
     wf: dict[str, dict] = {
@@ -365,16 +360,12 @@ def video_generate(
 
     if turbo:
         wf["6"] = _node("LoraLoaderModelOnly", "正在加载模型", model=["1", 0], lora_name=VID["turbo_lora"], strength_model=1.0)
-        wf["7"] = _node("ModelSamplingSD3", "正在加载模型", model=["6", 0], shift=3.0)
-        model_out, steps = ["7", 0], 8
+        model_out, steps = ["6", 0], 8
     else:
-        wf["6"] = _node("CFGOverride", "正在加载模型", model=["1", 0], cfg=3.5, start_percent=0.0, end_percent=0.75)
-        wf["7"] = _node("RescaleCFG", "正在加载模型", model=["6", 0], multiplier=0.7)
-        wf["8"] = _node("ModelSamplingSD3", "正在加载模型", model=["7", 0], shift=5.0)
-        model_out, steps = ["8", 0], 20
+        model_out, steps = ["1", 0], 20
 
     wf["9"] = _node("BasicGuider", "正在生成", model=model_out, conditioning=["5", 0])
-    wf["10"] = _node("KSamplerSelect", "正在生成", sampler_name="euler")
+    wf["10"] = _node("KSamplerSelect", "正在生成", sampler_name="res_multistep")
     wf["11"] = _node("BasicScheduler", "正在生成", model=model_out, scheduler="simple", steps=steps, denoise=1.0)
     wf["12"] = _node("RandomNoise", "正在生成", noise_seed=seed)
     wf["13"] = _node(
@@ -389,5 +380,5 @@ def video_generate(
     wf["14"] = _node("VAEDecode", "正在保存", samples=["13", 0], vae=["3", 0])
     wf["15"] = _node("VAEDecodeAudio", "正在解码音频", samples=["13", 0], vae=["4", 0])
     wf["16"] = _node("CreateVideo", "正在保存", images=["14", 0], audio=["15", 0], fps=24)
-    wf["17"] = _node("SaveVideo", "正在保存", video=["16", 0], filename_prefix="studio_vid", format="mp4", codec="h264")
+    wf["17"] = _node("SaveVideo", "正在保存", video=["16", 0], filename_prefix="studio_vid", format="auto", **{"format.codec": "auto"})
     return wf

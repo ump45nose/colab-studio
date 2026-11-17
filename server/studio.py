@@ -15,7 +15,7 @@ import websockets
 
 from station import faceswap_runner
 from . import config, dreamid_pipeline, tracker, workflows
-from .runtime import PACK_LABELS, runtime
+from .runtime import COMFY_PORT, COMFY_URL, PACK_LABELS, runtime
 
 STATE_FILE = config.DATA_DIR / "state.json"
 MEDIA_DIR = config.DATA_DIR / "media"
@@ -140,8 +140,8 @@ async def cancel_job(jid: str) -> dict | None:
                 async with httpx.AsyncClient(timeout=5) as http:
                     pid = _comfy_prompt_ids.get(jid)
                     if pid:
-                        await http.post(f"{runtime.COMFY_URL}/queue", json={"delete": [pid]})
-                    await http.post(f"{runtime.COMFY_URL}/interrupt")
+                        await http.post(f"{COMFY_URL}/queue", json={"delete": [pid]})
+                    await http.post(f"{COMFY_URL}/interrupt")
             except Exception:
                 pass
         elif runtime.state == "starting":
@@ -238,6 +238,11 @@ async def _work(jid: str) -> None:
 
             await runtime.ensure_models(pack, on_progress=_pack_progress)
 
+        if job["kind"] == "faceswap" and job["params"].get("engine") == "dreamid_v_faster":
+            _update(jid, stage="正在准备 DreamID-V 模型和运行环境")
+            token = shlex.quote(config.HF_TOKEN)
+            await runtime.ssh(f"env HF_TOKEN={token} bash /content/station/setup_dreamid.sh", timeout=3600)
+
         await asyncio.wait_for(_run(job), timeout=JOB_TIMEOUT)
     except asyncio.TimeoutError:
         if jobs[jid]["status"] != "cancelled":
@@ -263,23 +268,28 @@ async def _work(jid: str) -> None:
 async def _upload_to_comfy(http: httpx.AsyncClient, local_name: str) -> str:
     path = MEDIA_DIR / Path(local_name).name
     data = await asyncio.to_thread(path.read_bytes)
-    r = await http.post(f"{runtime.COMFY_URL}/upload/image", files={"image": (path.name, data)})
+    r = await http.post(f"{COMFY_URL}/upload/image", files={"image": (path.name, data)})
     r.raise_for_status()
     return r.json()["name"]
 
 
 async def _free_comfy_vram(http: httpx.AsyncClient) -> None:
     """Ask ComfyUI to unload models and free CUDA cache before running FaceFusion / DreamID-V."""
-    if not runtime.warm:
-        return
-    try:
-        await http.post(
-            f"{runtime.COMFY_URL}/free",
-            json={"unload_models": True, "free_memory": True},
-            timeout=15,
+    response = await http.post(
+        f"{COMFY_URL}/free",
+        json={"unload_models": True, "free_memory": True},
+        timeout=15,
+    )
+    response.raise_for_status()
+    for _ in range(30):
+        used = await runtime.ssh(
+            "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits", timeout=15
         )
-    except Exception:
-        pass
+        if int(used.splitlines()[0].strip()) <= 2048:
+            break
+        await asyncio.sleep(1)
+    else:
+        raise RuntimeError("ComfyUI 未能及时释放显存")
     runtime.warm.clear()
 
 
@@ -357,7 +367,7 @@ async def _run_faceswap(http: httpx.AsyncClient, job: dict) -> None:
                 spec_local.unlink(missing_ok=True)
 
             raw_out = await runtime.ssh(
-                f"python3 /content/station/faceswap_runner.py {shlex.quote(remote_job_dir)}/spec.json",
+                f"FACEFUSION_PYTHON=/content/faceenv/bin/python python3 /content/station/faceswap_runner.py {shlex.quote(remote_job_dir)}/spec.json",
                 timeout=JOB_TIMEOUT,
             )
             remote_outputs = []
@@ -445,26 +455,30 @@ while cur < total_frames:
 swapped_files = []
 for idx, (start_f, count_f) in enumerate(chunks):
     chunk_in = work_dir / f"chunk_in_{{idx:03d}}.mp4"
+    chunk_raw = work_dir / f"chunk_raw_{{idx:03d}}.mp4"
     chunk_out = work_dir / f"chunk_out_{{idx:03d}}.mp4"
     end_f = start_f + count_f - 1
-    vf = f"select='between(n\\\\,{{start_f}}\\\\,{{end_f}})',setpts=N/({{fps}}*TB)"
+    aligned = max(5, ((count_f + 2) // 4) * 4 + 1)
+    sep = chr(92)
+    vf = f"select=between(n{{sep}},{{start_f}}{{sep}},{{end_f}}),setpts=N/({{fps}}*TB),tpad=stop_mode=clone:stop={{aligned - count_f}}"
     subprocess.run(
         ["ffmpeg", "-y", "-i", target_media, "-vf", vf, "-an",
          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16", str(chunk_in)],
         check=True,
     )
-    aligned = max(5, min(count_f, max_frames))
-    aligned = ((aligned - 1) // 4) * 4 + 1
     subprocess.run(
-        ["python3", "/content/DreamID-V/express_adaption/wan_swapface.py",
+        ["/content/dreamenv/bin/python", "/content/DreamID-V/generate_dreamidv_faster.py",
          "--task", "swapface", "--size", "832*480",
          "--ckpt_dir", "/content/models/dreamid_v/Wan2.1-T2V-1.3B",
          "--dreamidv_ckpt", "/content/models/dreamid_v/dreamidv_faster.pth",
-         "--sample_steps", "12", "--frame_num", str(aligned),
-         "--Sample_guide_scale_img", "4.0",
-         "--ref_Path", f"{{chunk_in}},{{source_image}}",
-         "--save_file", str(chunk_out)],
-        check=True,
+         "--sample_steps", "12", "--frame_num", str(aligned), "--sample_fps", str(round(fps)),
+         "--sample_guide_scale_img", "4.0", "--ref_video", str(chunk_in),
+         "--ref_image", source_image, "--save_file", str(chunk_raw)],
+        cwd="/content/DreamID-V", check=True,
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(chunk_raw), "-frames:v", str(count_f),
+         "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(chunk_out)], check=True,
     )
     swapped_files.append(chunk_out)
 
@@ -474,7 +488,7 @@ subprocess.run(
     ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt),
      "-i", target_media, "-map", "0:v:0", "-map", "1:a:0?",
      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
-     "-c:a", "aac", "-shortest", str(final_output)],
+     "-c:a", "aac", "-af", "apad", "-shortest", str(final_output)],
     check=True,
 )
 """
@@ -542,7 +556,7 @@ async def _exec_workflow(
     http: httpx.AsyncClient, jid: str, kind: str, wf: dict, idx: int = 0, total: int = 1
 ) -> list[dict]:
     client_id = uuid.uuid4().hex
-    ws_url = f"ws://127.0.0.1:{runtime.COMFY_PORT}/ws?clientId={client_id}"
+    ws_url = f"ws://127.0.0.1:{COMFY_PORT}/ws?clientId={client_id}"
     titles = {nid: n.get("_meta", {}).get("title", "正在执行") for nid, n in wf.items()}
     prefix = f"[{idx + 1}/{total}] " if total > 1 else ""
     is_warm = kind in runtime.warm
@@ -568,7 +582,7 @@ async def _exec_workflow(
 
     try:
         async with ws_cm as ws:
-            r = await http.post(f"{runtime.COMFY_URL}/prompt", json={"prompt": wf, "client_id": client_id})
+            r = await http.post(f"{COMFY_URL}/prompt", json={"prompt": wf, "client_id": client_id})
             if r.status_code != 200:
                 raise RuntimeError(f"ComfyUI 拒绝了任务: {r.text[:300]}")
             prompt_id = r.json()["prompt_id"]
@@ -608,7 +622,7 @@ async def _exec_workflow(
         tracker.record_stage(kind, cur_stage, is_warm, time.time() - stage_t0)
     runtime.warm.add(kind)
 
-    hist = (await http.get(f"{runtime.COMFY_URL}/history/{prompt_id}")).json().get(prompt_id, {})
+    hist = (await http.get(f"{COMFY_URL}/history/{prompt_id}")).json().get(prompt_id, {})
     return await _collect_outputs(http, jid, hist.get("outputs", {}), idx)
 
 
@@ -618,7 +632,7 @@ async def _wait_history(http: httpx.AsyncClient, prompt_id: str, timeout: int = 
     for _ in range(timeout // 2):
         await asyncio.sleep(2)
         try:
-            h = (await http.get(f"{runtime.COMFY_URL}/history/{prompt_id}")).json().get(prompt_id)
+            h = (await http.get(f"{COMFY_URL}/history/{prompt_id}")).json().get(prompt_id)
             if h and h.get("outputs"):
                 return True
         except Exception:
@@ -636,7 +650,7 @@ async def _collect_outputs(http: httpx.AsyncClient, jid: str, raw_outputs: dict,
                 fn = item["filename"]
                 ext = Path(fn).suffix.lower()
                 r = await http.get(
-                    f"{runtime.COMFY_URL}/view",
+                    f"{COMFY_URL}/view",
                     params={
                         "filename": fn,
                         "subfolder": item.get("subfolder", ""),

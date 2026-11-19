@@ -11,8 +11,8 @@
 #   size_gb  预计体积（GB），用于下载进度估算
 #   sha256   可选；64 位十六进制 SHA-256 校验值
 
-# 图片主力工作流（默认）：Krea2-Noct / Noct-Q V4（支持文生图 + 多参考图编辑）
-# 也可将 diffusion 替换为 repo = "Noctaluna/Krea2-Noct-Uncensored", file = "KreaNoct_V4_int8_convrot.safetensors"
+# 图片主力工作流（默认）：Noct-Q V4（Qwen-Image 2.1 无审查写实微调，支持文生图 + 多参考图编辑）
+# 注意：替换 diffusion 时必须选用同属 Qwen-Image 2.1 架构的权重（Krea 2 架构不可直接互换）。
 [image]
 diffusion  = { repo = "Noctaluna/Noct-Q-Uncensored-Qwen-Image-2.1", file = "NoctQ_V4_int8_convrot.safetensors", dir = "diffusion_models", size_gb = 7.26 }
 encoder    = { repo = "Comfy-Org/Qwen-Image-2.1", file = "text_encoders/qwen3vl_8b_int8_convrot.safetensors", dir = "text_encoders", size_gb = 9.351 }

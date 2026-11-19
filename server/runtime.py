@@ -235,7 +235,7 @@ class Runtime:
             "ssh",
             "mkdir -p /content && tar -xf - -C /content "
             "&& ([ ! -f /content/models.toml ] || mv /content/models.toml /content/station/models.default.toml) "
-            "&& chmod +x /content/station/runtime_setup.sh",
+            "&& chmod +x /content/station/*.sh",
         )
         rc, err = await asyncio.to_thread(self._ship_station_sync, tar_cmd, ssh_cmd)
         if rc != 0:
@@ -243,7 +243,7 @@ class Runtime:
 
     # --- Lifecycle ---------------------------------------------------------
 
-    async def ensure_ready(self) -> None:
+    async def ensure_ready(self, initial_pack: str | None = None) -> None:
         if self.state == "ready":
             self.touch()
             return
@@ -251,9 +251,9 @@ class Runtime:
             if self.state == "ready":
                 self.touch()
                 return
-            await self._boot()
+            await self._boot(initial_pack=initial_pack)
 
-    async def _boot(self) -> None:
+    async def _boot(self, initial_pack: str | None = None) -> None:
         self.state = "starting"
         self.error = None
         self.warm.clear()
@@ -278,9 +278,14 @@ class Runtime:
             await self._ship_station()
             done = await self.ssh("test -f /content/.setup_done && echo yes || echo no")
             if done != "yes":
-                self.step = "正在下载模型并部署 ComfyUI 与 FaceFusion"
-                self._log("开始首次环境初始化（下载图片主模型 + 部署 ComfyUI & FaceFusion 双补丁）...")
-                await self._run_setup_Remote()
+                if initial_pack:
+                    label = PACK_LABELS.get(initial_pack, initial_pack)
+                    self.step = f"正在部署 ComfyUI 并并行预热 {label}"
+                    self._log(f"开始首次环境初始化（ComfyUI + 并行预热 {label}；FaceFusion 按需部署）...")
+                else:
+                    self.step = "正在部署 ComfyUI 核心环境"
+                    self._log("开始首次环境初始化（仅部署 ComfyUI 核心环境；模型与换脸引擎按需部署）...")
+                await self._run_setup_Remote(initial_pack=initial_pack)
 
             self.step = "正在启动 ComfyUI"
             self.setup_step = None
@@ -301,16 +306,18 @@ class Runtime:
             self.step = f"错误: {e}"
             self._log(f"错误: {e}")
             self._kill_tunnel()
+            self._close_control_master()
             if SESSION_FILE.exists():
                 self._log("启动失败，正在释放远端 GPU 以避免空转扣费...")
                 await self._force_disconnect("启动失败，正在关闭")
             raise
 
-    async def _run_setup_Remote(self) -> None:
+    async def _run_setup_Remote(self, initial_pack: str | None = None) -> None:
         hf = shlex.quote(config.HF_TOKEN)
+        pack_arg = f" {shlex.quote(initial_pack)}" if initial_pack else ""
         await self.ssh(
-            "if ! pgrep -f '/content/station/[r]untime_setup.sh' >/dev/null; then "
-            f"nohup env HF_TOKEN={hf} bash /content/station/[r]untime_setup.sh image "
+            "if ! pgrep -f '^bash /content/station/[r]untime_setup\\.sh' >/dev/null; then "
+            f"nohup env HF_TOKEN={hf} bash /content/station/[r]untime_setup.sh{pack_arg} "
             "> /content/setup.log 2>&1 < /dev/null & fi"
         )
         while True:
@@ -339,9 +346,12 @@ class Runtime:
 
     def _spawn_tunnel_proc(self) -> None:
         self._kill_tunnel()
+        # Multiplex the local port forward over the active ControlMaster (`colab ssh --proxy-mode`).
+        # Opening a second independent `colab ssh` proxy with ControlPath=none can stall against
+        # the existing session relay; if the mux client returns 0, the ControlMaster keeps the
+        # `-L` forward alive.
         cmd = [
             "ssh", *self._ssh_flags, "-N",
-            "-o", "ControlMaster=no",
             "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=3",
             "-o", "ExitOnForwardFailure=yes",
             "-L", f"127.0.0.1:{COMFY_PORT}:127.0.0.1:8188",
@@ -352,9 +362,22 @@ class Runtime:
     async def _start_tunnel(self) -> None:
         await asyncio.to_thread(self._spawn_tunnel_proc)
         await asyncio.sleep(1.0)
-        if self._tunnel and self._tunnel.poll() is not None:
+        if self._tunnel and self._tunnel.poll() not in (None, 0):
             err = (self._tunnel.stderr.read().decode(errors="replace") if self._tunnel.stderr else "").strip()
             raise RuntimeError(f"SSH 隧道建立失败: {err or self._tunnel.returncode}")
+
+    def _close_control_master(self) -> None:
+        if not self._ssh_host or not self._ssh_flags:
+            return
+        try:
+            subprocess.run(
+                ["ssh", *self._ssh_flags, "-O", "exit", self._ssh_host],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception:
+            pass
 
     def _kill_tunnel(self) -> None:
         if self._tunnel and self._tunnel.poll() is None:
@@ -405,6 +428,7 @@ class Runtime:
             self.step = f"正在关闭 ({reason})"
             self._log(f"正在关闭 GPU: {reason}")
             self._kill_tunnel()
+            self._close_control_master()
             try:
                 await self._stop_owned_session()
             except Exception as e:
@@ -445,8 +469,9 @@ class Runtime:
             last_advance = time.time()
             hf = shlex.quote(config.HF_TOKEN)
             qpack = shlex.quote(pack)
+            pack_pat = shlex.quote(f"[m]odels.py.*(^| ){pack}($| )")
             await self.ssh(
-                f"if ! pgrep -f '[m]odels.py.*{qpack}' >/dev/null; then "
+                f"if ! pgrep -f {pack_pat} >/dev/null; then "
                 f"nohup env HF_TOKEN={hf} /content/hfenv/bin/python /content/station/[m]odels.py {qpack} "
                 ">> /content/models.log 2>&1 < /dev/null & fi"
             )
@@ -470,7 +495,7 @@ class Runtime:
                 elif time.time() - last_advance > SETUP_STALL_TIMEOUT:
                     await self.ssh("pkill -f '/content/station/[m]odels.py' || true")
                     raise RuntimeError(f"{label} 模型连续 {SETUP_STALL_TIMEOUT // 60} 分钟无进度，下载卡死")
-                running = await self.ssh(f"pgrep -f '[m]odels.py.*{qpack}' >/dev/null && echo y || echo n")
+                running = await self.ssh(f"pgrep -f {pack_pat} >/dev/null && echo y || echo n")
                 if running != "y":
                     await self._refresh_telemetry()
                     p = self.models.get("packs", {}).get(pack, {})
@@ -555,14 +580,14 @@ class Runtime:
             if self.state != "ready":
                 health_fails = 0
                 continue
-            if self._tunnel is None or self._tunnel.poll() is not None:
+            alive = await asyncio.to_thread(self._Comfy_alive)
+            if not alive and (self._tunnel is None or self._tunnel.poll() is not None):
                 try:
                     self._log("SSH 隧道断开，正在重连...")
                     await self._start_tunnel()
+                    alive = await asyncio.to_thread(self._Comfy_alive)
                 except Exception as e:
                     self._log(f"隧道重连失败: {e}")
-
-            alive = await asyncio.to_thread(self._Comfy_alive)
             if alive:
                 health_fails = 0
                 await self._refresh_telemetry()

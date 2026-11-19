@@ -209,17 +209,17 @@ async def worker_loop() -> None:
 
 async def _work(jid: str) -> None:
     job = jobs[jid]
+    pack = _pack_for_job(job)
     runtime.active_jobs += 1
     try:
         _update(jid, status="running", stage=runtime.step if runtime.state != "ready" else "正在准备", started_at=time.time())
         try:
-            await runtime.ensure_ready()
+            await runtime.ensure_ready(initial_pack=pack)
         except Exception as e:
             if jobs[jid]["status"] != "cancelled":
                 _update(jid, status="error", stage=None, error=f"GPU 启动失败: {e}", finished_at=time.time())
             return
 
-        pack = _pack_for_job(job)
         if pack is not None:
             label = PACK_LABELS.get(pack, pack)
 
@@ -238,10 +238,14 @@ async def _work(jid: str) -> None:
 
             await runtime.ensure_models(pack, on_progress=_pack_progress)
 
-        if job["kind"] == "faceswap" and job["params"].get("engine") == "dreamid_v_faster":
-            _update(jid, stage="正在准备 DreamID-V 模型和运行环境")
-            token = shlex.quote(config.HF_TOKEN)
-            await runtime.ssh(f"env HF_TOKEN={token} bash /content/station/setup_dreamid.sh", timeout=3600)
+        if job["kind"] == "faceswap":
+            if job["params"].get("engine") == "dreamid_v_faster":
+                _update(jid, stage="正在按需准备 DreamID-V 模型和运行环境")
+                token = shlex.quote(config.HF_TOKEN)
+                await runtime.ssh(f"env HF_TOKEN={token} bash /content/station/setup_dreamid.sh", timeout=3600)
+            else:
+                _update(jid, stage="正在按需部署 FaceFusion 换脸环境")
+                await runtime.ssh("bash /content/station/setup_facefusion.sh", timeout=1800)
 
         await asyncio.wait_for(_run(job), timeout=JOB_TIMEOUT)
     except asyncio.TimeoutError:

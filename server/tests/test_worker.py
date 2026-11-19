@@ -30,7 +30,10 @@ async def test_faceswap_worker_frees_vram_and_runs_compare_all(monkeypatch: pyte
     freed_calls: list[str] = []
     ssh_cmds: list[str] = []
 
-    async def _fake_ensure_ready():
+    ready_packs: list[str | None] = []
+
+    async def _fake_ensure_ready(initial_pack: str | None = None):
+        ready_packs.append(initial_pack)
         runtime.state = "ready"
 
     async def _fake_free(http):
@@ -77,6 +80,8 @@ async def test_faceswap_worker_frees_vram_and_runs_compare_all(monkeypatch: pyte
 
     done = studio.jobs[job["id"]]
     assert done["status"] == "done"
+    assert ready_packs == [None]
+    assert any("setup_facefusion.sh" in cmd for cmd in ssh_cmds)
     assert freed_calls == ["freed"]
     assert len(done["outputs"]) == 3
     assert [o["model"] for o in done["outputs"]] == [

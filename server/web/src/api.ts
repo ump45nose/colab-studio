@@ -8,6 +8,15 @@ export type FaceSwapEngine = "facefusion_cli" | "dreamid_v_faster";
 export type SwapperModel = "hyperswap_1a_256" | "alphaface_256" | "inswapper_128_fp16";
 export type PixelBoost = "256x256" | "512x512" | "768x768" | "1024x1024";
 export type EnhancerModel = "none" | "codeformer" | "gfpgan_1.4";
+export type FaceSelectorMode = "reference" | "one" | "many";
+export type FaceSelectorGender = "all" | "female" | "male";
+export type FaceSelectorOrder =
+  | "large-small"
+  | "left-right"
+  | "right-left"
+  | "top-bottom"
+  | "bottom-top"
+  | "best-worst";
 
 export interface PackStatus {
   ready: boolean;

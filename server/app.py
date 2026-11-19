@@ -160,6 +160,9 @@ def _faceswap_params(p: dict) -> dict:
             "pixel_boost",
             "enhancer_model",
             "enhancer_blend",
+            "face_selector_mode",
+            "face_selector_gender",
+            "face_selector_order",
         },
     )
     engine = p.get("engine", "facefusion_cli")
@@ -176,6 +179,15 @@ def _faceswap_params(p: dict) -> dict:
     if enhancer_model not in faceswap_runner.VALID_ENHANCERS:
         raise _bad(f"无效的后处理增强模型: {enhancer_model}")
     enhancer_blend = _num(p.get("enhancer_blend", 50), "增强混合比", 0, 100, integer=True)
+    face_selector_mode = p.get("face_selector_mode", "reference")
+    if face_selector_mode not in faceswap_runner.VALID_FACE_SELECTOR_MODES:
+        raise _bad(f"无效的人脸选择模式: {face_selector_mode}")
+    face_selector_gender = p.get("face_selector_gender", "all")
+    if face_selector_gender not in faceswap_runner.VALID_FACE_SELECTOR_GENDERS:
+        raise _bad(f"无效的目标性别筛选: {face_selector_gender}")
+    face_selector_order = p.get("face_selector_order", "large-small")
+    if face_selector_order not in faceswap_runner.VALID_FACE_SELECTOR_ORDERS:
+        raise _bad(f"无效的人脸排序方式: {face_selector_order}")
     return {
         "engine": engine,
         "swapper_model": swapper_model,
@@ -183,6 +195,9 @@ def _faceswap_params(p: dict) -> dict:
         "pixel_boost": pixel_boost,
         "enhancer_model": enhancer_model,
         "enhancer_blend": enhancer_blend,
+        "face_selector_mode": face_selector_mode,
+        "face_selector_gender": face_selector_gender,
+        "face_selector_order": face_selector_order,
     }
 
 

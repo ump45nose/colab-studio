@@ -362,6 +362,9 @@ async def _run_faceswap(http: httpx.AsyncClient, job: dict) -> None:
                 "pixel_boost": p.get("pixel_boost", "256x256"),
                 "enhancer_model": p.get("enhancer_model", "none"),
                 "enhancer_blend": int(p.get("enhancer_blend", 50)),
+                "face_selector_mode": p.get("face_selector_mode", "reference"),
+                "face_selector_gender": p.get("face_selector_gender", "all"),
+                "face_selector_order": p.get("face_selector_order", "large-small"),
             }
             spec_local = MEDIA_DIR / f".spec_{jid}.json"
             spec_local.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")

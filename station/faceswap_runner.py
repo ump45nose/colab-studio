@@ -28,6 +28,24 @@ VALID_ENHANCERS: tuple[str, ...] = (
     "codeformer",
     "gfpgan_1.4",
 )
+VALID_FACE_SELECTOR_MODES: tuple[str, ...] = (
+    "reference",
+    "one",
+    "many",
+)
+VALID_FACE_SELECTOR_GENDERS: tuple[str, ...] = (
+    "all",
+    "female",
+    "male",
+)
+VALID_FACE_SELECTOR_ORDERS: tuple[str, ...] = (
+    "large-small",
+    "left-right",
+    "right-left",
+    "top-bottom",
+    "bottom-top",
+    "best-worst",
+)
 
 MODEL_LABELS: dict[str, str] = {
     "hyperswap_1a_256": "HyperSwap 1A 256",
@@ -57,6 +75,9 @@ def build_facefusion_cmd(
     pixel_boost: str = "256x256",
     enhancer_model: str = "none",
     enhancer_blend: int = 50,
+    face_selector_mode: str = "reference",
+    face_selector_gender: str = "all",
+    face_selector_order: str = "large-small",
     facefusion_dir: str | Path = "/content/facefusion",
     python_bin: str = "python3",
     execution_provider: str = "cuda",
@@ -72,6 +93,12 @@ def build_facefusion_cmd(
         raise ValueError(f"无效的后处理增强模型: {enhancer_model}")
     if not (0 <= int(enhancer_blend) <= 100):
         raise ValueError(f"增强混合比必须在 0-100 之间: {enhancer_blend}")
+    if face_selector_mode not in VALID_FACE_SELECTOR_MODES:
+        raise ValueError(f"无效的人脸选择模式: {face_selector_mode}")
+    if face_selector_gender not in VALID_FACE_SELECTOR_GENDERS:
+        raise ValueError(f"无效的目标性别筛选: {face_selector_gender}")
+    if face_selector_order not in VALID_FACE_SELECTOR_ORDERS:
+        raise ValueError(f"无效的人脸排序方式: {face_selector_order}")
 
     processors = ["face_swapper"]
     if enhancer_model != "none":
@@ -88,6 +115,10 @@ def build_facefusion_cmd(
         swapper_model,
         "--face-swapper-pixel-boost",
         pixel_boost,
+        "--face-selector-mode",
+        face_selector_mode,
+        "--face-selector-order",
+        face_selector_order,
         "--target-path",
         str(target_path),
         "--output-path",
@@ -97,6 +128,8 @@ def build_facefusion_cmd(
         "--log-level",
         "info",
     ]
+    if face_selector_gender != "all":
+        cmd.extend(["--face-selector-gender", face_selector_gender])
     cmd.extend(["-s", *(str(src) for src in source_paths)])
     if enhancer_model != "none":
         cmd.extend([
@@ -130,6 +163,9 @@ def run_facefusion_job(spec: dict) -> list[tuple[str, Path]]:
     pixel_boost = spec.get("pixel_boost", "256x256")
     enhancer_model = spec.get("enhancer_model", "none")
     enhancer_blend = int(spec.get("enhancer_blend", 50))
+    face_selector_mode = spec.get("face_selector_mode", "reference")
+    face_selector_gender = spec.get("face_selector_gender", "all")
+    face_selector_order = spec.get("face_selector_order", "large-small")
     facefusion_dir = Path(spec.get("facefusion_dir") or os.environ.get("FACEFUSION_DIR", "/content/facefusion"))
     python_bin = spec.get("python_bin") or os.environ.get("FACEFUSION_PYTHON", "python3")
     provider = spec.get("execution_provider") or os.environ.get("FACEFUSION_PROVIDER", "cuda")
@@ -151,6 +187,9 @@ def run_facefusion_job(spec: dict) -> list[tuple[str, Path]]:
             pixel_boost=pixel_boost,
             enhancer_model=enhancer_model,
             enhancer_blend=enhancer_blend,
+            face_selector_mode=face_selector_mode,
+            face_selector_gender=face_selector_gender,
+            face_selector_order=face_selector_order,
             facefusion_dir=facefusion_dir,
             python_bin=python_bin,
             execution_provider=provider,

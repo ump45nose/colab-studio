@@ -2,6 +2,9 @@ import { Bookmark, HelpCircle, RotateCcw, Shuffle, Trash2, X, Zap } from "lucide
 import { ReactNode, useState } from "react";
 import {
   EnhancerModel,
+  FaceSelectorGender,
+  FaceSelectorMode,
+  FaceSelectorOrder,
   FaceSwapEngine,
   ImageProfile,
   Mode,
@@ -15,6 +18,9 @@ import {
   DEFAULT_VIDEO,
   EDIT_RES_INFO,
   ENHANCER_OPTIONS,
+  FACE_GENDER_OPTIONS,
+  FACE_MODE_OPTIONS,
+  FACE_ORDER_OPTIONS,
   FaceSwapSettings,
   IMAGE_SIZE_INFO,
   ImageSettings,
@@ -444,6 +450,58 @@ export default function Settings({
                   </select>
                 </Field>
               )}
+
+              <Field
+                label={t("多人场景目标人脸选择")}
+                help={t(
+                  "双人或多人画面建议先按性别筛选（例如仅替换女性或仅替换男性），同性别多人时再配合排序规则精确定位，避免误换错人。"
+                )}
+              >
+                <select
+                  value={fswap.face_selector_gender}
+                  onChange={(e) =>
+                    onFswap({ ...fswap, face_selector_gender: e.target.value as FaceSelectorGender })
+                  }
+                >
+                  {FACE_GENDER_OPTIONS.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {t(g.label)}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+
+              <Field
+                label={t("人脸排序与选择模式")}
+                help={t("追踪单人适合视频连续锁脸；仅换 1 张脸按排序选首张匹配脸；替换全部会替换画面中所有符合性别的人脸。")}
+              >
+                <div className="preset-row">
+                  <select
+                    value={fswap.face_selector_order}
+                    onChange={(e) =>
+                      onFswap({ ...fswap, face_selector_order: e.target.value as FaceSelectorOrder })
+                    }
+                  >
+                    {FACE_ORDER_OPTIONS.map((o) => (
+                      <option key={o.id} value={o.id}>
+                        {t(o.label)}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={fswap.face_selector_mode}
+                    onChange={(e) =>
+                      onFswap({ ...fswap, face_selector_mode: e.target.value as FaceSelectorMode })
+                    }
+                  >
+                    {FACE_MODE_OPTIONS.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {t(m.label)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </Field>
 
               <Field
                 label={t("超分像素倍率 (Pixel Boost)")}

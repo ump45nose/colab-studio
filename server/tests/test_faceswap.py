@@ -128,6 +128,19 @@ def test_build_facefusion_cmd_without_and_with_enhancer():
     assert "face_enhancer" in cmd_enh
     assert cmd_enh[cmd_enh.index("--face-enhancer-model") + 1] == "codeformer"
     assert cmd_enh[cmd_enh.index("--face-enhancer-blend") + 1] == "50"
+    assert "--face-selector-gender" not in cmd_raw
+
+    cmd_sel = faceswap_runner.build_facefusion_cmd(
+        source_paths=["/tmp/src1.png"],
+        target_path="/tmp/target.png",
+        output_path="/tmp/out.png",
+        face_selector_mode="one",
+        face_selector_gender="female",
+        face_selector_order="left-right",
+    )
+    assert cmd_sel[cmd_sel.index("--face-selector-mode") + 1] == "one"
+    assert cmd_sel[cmd_sel.index("--face-selector-gender") + 1] == "female"
+    assert cmd_sel[cmd_sel.index("--face-selector-order") + 1] == "left-right"
 
 
 def test_dreamid_plan_frame_chunks():

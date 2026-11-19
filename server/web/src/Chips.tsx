@@ -1,6 +1,9 @@
 import { Bookmark, Clock, Layers, SlidersHorizontal, Zap } from "lucide-react";
 import {
   EnhancerModel,
+  FaceSelectorGender,
+  FaceSelectorMode,
+  FaceSelectorOrder,
   FaceSwapEngine,
   ImageProfile,
   Mode,
@@ -43,6 +46,9 @@ export interface FaceSwapSettings {
   pixel_boost: PixelBoost;
   enhancer_model: EnhancerModel;
   enhancer_blend: number;
+  face_selector_mode: FaceSelectorMode;
+  face_selector_gender: FaceSelectorGender;
+  face_selector_order: FaceSelectorOrder;
 }
 
 export const DEFAULT_IMAGE: ImageSettings = {
@@ -76,6 +82,9 @@ export const DEFAULT_FACESWAP: FaceSwapSettings = {
   pixel_boost: "256x256",
   enhancer_model: "none",
   enhancer_blend: 50,
+  face_selector_mode: "reference",
+  face_selector_gender: "all",
+  face_selector_order: "large-small",
 };
 
 export const IMAGE_RATIOS = ["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9"];
@@ -105,6 +114,27 @@ export const ENHANCER_OPTIONS: { id: EnhancerModel; label: string }[] = [
   { id: "none", label: "关闭增强（底模直出）" },
   { id: "codeformer", label: "CodeFormer" },
   { id: "gfpgan_1.4", label: "GFPGAN 1.4" },
+];
+
+export const FACE_GENDER_OPTIONS: { id: FaceSelectorGender; label: string }[] = [
+  { id: "all", label: "不限性别" },
+  { id: "female", label: "仅女性" },
+  { id: "male", label: "仅男性" },
+];
+
+export const FACE_MODE_OPTIONS: { id: FaceSelectorMode; label: string }[] = [
+  { id: "reference", label: "追踪单人（默认）" },
+  { id: "one", label: "仅换 1 张脸" },
+  { id: "many", label: "替换全部匹配人脸" },
+];
+
+export const FACE_ORDER_OPTIONS: { id: FaceSelectorOrder; label: string }[] = [
+  { id: "large-small", label: "最大人脸优先" },
+  { id: "left-right", label: "从左到右" },
+  { id: "right-left", label: "从右到左" },
+  { id: "top-bottom", label: "从上到下" },
+  { id: "bottom-top", label: "从下到上" },
+  { id: "best-worst", label: "最清晰优先" },
 ];
 
 interface Props {
@@ -341,6 +371,13 @@ export default function Chips({
                     onChange={(v) => onFswap({ ...fswap, swapper_model: v as SwapperModel })}
                   />
                 )}
+                <Select
+                  label={t("目标脸")}
+                  value={fswap.face_selector_gender}
+                  options={FACE_GENDER_OPTIONS.map((g) => g.id)}
+                  display={(v) => t(FACE_GENDER_OPTIONS.find((g) => g.id === v)?.label ?? v)}
+                  onChange={(v) => onFswap({ ...fswap, face_selector_gender: v as FaceSelectorGender })}
+                />
                 <Select
                   label={t("超分倍率")}
                   value={fswap.pixel_boost}

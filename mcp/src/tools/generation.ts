@@ -283,6 +283,18 @@ export function registerGenerationTools(server: McpServer): void {
           .max(100)
           .default(50)
           .describe("Enhancer blend percentage (recommended 40-60 to avoid plastic skin texture)."),
+        face_selector_mode: z
+          .enum(["reference", "one", "many"])
+          .default("reference")
+          .describe("Multi-person face selection mode: 'reference' (video tracking), 'one' (single matching face), or 'many' (all matching faces)."),
+        face_selector_gender: z
+          .enum(["all", "female", "male"])
+          .default("all")
+          .describe("Filter target faces by gender ('all', 'female', or 'male') to avoid swapping the wrong person."),
+        face_selector_order: z
+          .enum(["large-small", "left-right", "right-left", "top-bottom", "bottom-top", "best-worst"])
+          .default("large-small")
+          .describe("Ordering used when selecting target face(s)."),
         prompt: z.string().default("").describe("Optional label or note for this face-swap job."),
         chat_id: z.string().optional(),
         wait: z.boolean().default(true),
@@ -308,6 +320,9 @@ export function registerGenerationTools(server: McpServer): void {
           pixel_boost: args.pixel_boost,
           enhancer_model: args.enhancer_model,
           enhancer_blend: args.enhancer_blend,
+          face_selector_mode: args.face_selector_mode,
+          face_selector_gender: args.face_selector_gender,
+          face_selector_order: args.face_selector_order,
         },
       });
       if (!args.wait) return formatJobResult(job);
